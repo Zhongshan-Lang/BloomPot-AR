@@ -1,0 +1,42 @@
+# Unity generated directories
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# Local recovery copies and Vuforia runtime cache
+[Bb]ackups/
+QCAR/
+
+# IDE and editor files
+.vs/
+.idea/
+.vscode/
+*.csproj
+*.sln
+*.slnx
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# Unity and platform build artifacts
+*.apk
+*.aab
+*.unitypackage
+sysinfo.txt
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
