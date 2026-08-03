@@ -12,8 +12,10 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
 {
     private const float ModelLoadRetryDelay = 2f;
     private const string PetalMaterialResourcePath = "HydrangeaInteractive/Materials/M_Hydrangea_Petals_Random";
+    private const string CenterMaterialResourcePath = "HydrangeaInteractive/Materials/M_Hydrangea_Centers";
     private const string SceneModelName = "Hydrangea_Growth_BlendShape_Unity";
     private static readonly string[] ManagedBlendShapes = { "Sprout", "Leafing", "Bud", "HalfBloom", "Bloom" };
+    private static readonly int BloomMaturityProperty = Shader.PropertyToID("_BloomMaturity");
     private static readonly Vector3 BlenderAxisFixEuler = new Vector3(-90f, 0f, 0f);
 
     [Header("Placement")]
@@ -29,11 +31,13 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     private Transform _stageRoot;
     private GameObject _modelInstance;
     private SkinnedMeshRenderer _meshRenderer;
+    private MaterialPropertyBlock _materialPropertyBlock;
     private Text _statusText;
     private readonly List<Button> _stageButtons = new List<Button>();
 
     private Coroutine _transitionRoutine;
     private float _presenceScale = 0.92f;
+    private float _currentBloomMaturity;
     private float _nextModelLoadAttemptTime;
     private bool _hasLoggedMissingSceneModel;
     private bool _hasLoggedModelDiagnostics;
@@ -43,6 +47,12 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     private int _fallbackBlendShapeIndex = -1;
     private string _currentStageName;
     private string _lastUiStageName;
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+    private static void EnsurePortraitOrientation()
+    {
+        Screen.orientation = ScreenOrientation.Portrait;
+    }
 
     private void Awake()
     {
@@ -359,6 +369,8 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         }
 
         const float duration = 0.35f;
+        var fromBloomMaturity = _currentBloomMaturity;
+        var targetBloomMaturity = GetBloomMaturity(blendShapeName);
         var elapsed = 0f;
         while (elapsed < duration)
         {
@@ -370,6 +382,8 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
                 var weight = Mathf.Lerp(fromWeights[index], targetWeight, t);
                 _meshRenderer.SetBlendShapeWeight(index, weight);
             }
+
+            SetBloomMaturity(Mathf.Lerp(fromBloomMaturity, targetBloomMaturity, t));
 
             yield return null;
         }
@@ -395,6 +409,37 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         {
             targetWeights.TryGetValue(index, out var targetWeight);
             _meshRenderer.SetBlendShapeWeight(index, targetWeight);
+        }
+
+        SetBloomMaturity(GetBloomMaturity(blendShapeName));
+    }
+
+    private void SetBloomMaturity(float maturity)
+    {
+        if (_meshRenderer == null)
+        {
+            return;
+        }
+
+        _materialPropertyBlock ??= new MaterialPropertyBlock();
+        _meshRenderer.GetPropertyBlock(_materialPropertyBlock);
+        _currentBloomMaturity = Mathf.Clamp01(maturity);
+        _materialPropertyBlock.SetFloat(BloomMaturityProperty, _currentBloomMaturity);
+        _meshRenderer.SetPropertyBlock(_materialPropertyBlock);
+    }
+
+    private static float GetBloomMaturity(string stageName)
+    {
+        switch (stageName)
+        {
+            case "Bud":
+                return 0.05f;
+            case "HalfBloom":
+                return 0.52f;
+            case "Bloom":
+                return 1f;
+            default:
+                return 0f;
         }
     }
 
@@ -533,46 +578,88 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         var petalMaterial = Resources.Load<Material>(PetalMaterialResourcePath);
         if (petalMaterial == null)
         {
-            Debug.LogError("HydrangeaInteractiveExperience: flower material resource is missing.");
+            Debug.LogError("HydrangeaInteractiveExperience: petal material resource is missing.");
+            return;
+        }
+
+        var centerMaterial = Resources.Load<Material>(CenterMaterialResourcePath);
+        if (centerMaterial == null)
+        {
+            Debug.LogError("HydrangeaInteractiveExperience: flower center material resource is missing.");
             return;
         }
 
         var mesh = _meshRenderer.sharedMesh;
         var slotCount = Mathf.Min(materials.Length, mesh != null ? mesh.subMeshCount : materials.Length);
-        var flowerSlots = new List<int>();
+        var petalSlots = new List<int>();
+        var centerSlots = new List<int>();
+        var genericFlowerSlots = new List<int>();
 
         for (var i = 0; i < slotCount; i++)
         {
             var materialName = materials[i] != null ? materials[i].name.ToLowerInvariant() : string.Empty;
-            if (materialName.Contains("flower") || materialName.Contains("petal") || materialName.Contains("center"))
+            if (materialName.Contains("center"))
             {
-                flowerSlots.Add(i);
+                centerSlots.Add(i);
+            }
+            else if (materialName.Contains("petal"))
+            {
+                petalSlots.Add(i);
+            }
+            else if (materialName.Contains("flower"))
+            {
+                genericFlowerSlots.Add(i);
             }
         }
 
-        // The current FBX exposes stems, leaves, and flower materials. Internally,
-        // petals and centers may still occupy separate submeshes but share one material.
-        if (flowerSlots.Count == 0 && slotCount >= 3)
+        // Older material remaps gave both flower submeshes the same generic name.
+        // Preserve their known order: petals first, centers second.
+        foreach (var slot in genericFlowerSlots)
         {
-            for (var i = 2; i < slotCount; i++)
+            if (petalSlots.Count == 0)
             {
-                flowerSlots.Add(i);
+                petalSlots.Add(slot);
+            }
+            else if (centerSlots.Count == 0 && slotCount >= 4)
+            {
+                centerSlots.Add(slot);
+            }
+            else
+            {
+                petalSlots.Add(slot);
             }
         }
 
-        if (flowerSlots.Count == 0)
+        if (petalSlots.Count == 0 && slotCount >= 3)
         {
-            Debug.LogWarning("HydrangeaInteractiveExperience: no flower material slot was found; material override was skipped.");
+            petalSlots.Add(2);
+        }
+
+        if (centerSlots.Count == 0 && slotCount >= 4)
+        {
+            centerSlots.Add(3);
+        }
+
+        if (petalSlots.Count == 0)
+        {
+            Debug.LogWarning("HydrangeaInteractiveExperience: no petal material slot was found; material override was skipped.");
             return;
         }
 
-        foreach (var slot in flowerSlots)
+        foreach (var slot in petalSlots)
         {
             materials[slot] = petalMaterial;
         }
 
+        foreach (var slot in centerSlots)
+        {
+            materials[slot] = centerMaterial;
+        }
+
         _meshRenderer.sharedMaterials = materials;
-        Debug.Log($"HydrangeaInteractiveExperience: applied flower material to slot(s) {string.Join(", ", flowerSlots)}.");
+        Debug.Log(
+            $"HydrangeaInteractiveExperience: applied petal material to slot(s) {string.Join(", ", petalSlots)} " +
+            $"and center material to slot(s) {string.Join(", ", centerSlots)}.");
     }
 
     private void ApplyInitialVisibleStage()
@@ -598,6 +685,8 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         {
             _meshRenderer.SetBlendShapeWeight(i, i == _fallbackBlendShapeIndex ? 100f : 0f);
         }
+
+        SetBloomMaturity(GetBloomMaturity("Bud"));
 
         Debug.Log($"HydrangeaInteractiveExperience: Bud blend shape was not found, using fallback blend shape index {_fallbackBlendShapeIndex} ({_meshRenderer.sharedMesh.GetBlendShapeName(_fallbackBlendShapeIndex)}).");
     }

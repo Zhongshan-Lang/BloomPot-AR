@@ -18,12 +18,12 @@ ModelImporter:
       type: UnityEngine:Material
       assembly: UnityEngine.CoreModule
       name: M_Hydrangea_Petals
-    second: {fileID: 2100000, guid: 7a5ac59a22116e44b847bd8b8db298ff, type: 2}
+    second: {fileID: 2100000, guid: 378451a7df3a3164ca849080283d1b88, type: 2}
   - first:
       type: UnityEngine:Material
       assembly: UnityEngine.CoreModule
       name: M_Hydrangea_Centers
-    second: {fileID: 2100000, guid: 7a5ac59a22116e44b847bd8b8db298ff, type: 2}
+    second: {fileID: 2100000, guid: f4d6f890955aee740bb9d67a6eecc1e7, type: 2}
   materials:
     materialImportMode: 2
     materialName: 0

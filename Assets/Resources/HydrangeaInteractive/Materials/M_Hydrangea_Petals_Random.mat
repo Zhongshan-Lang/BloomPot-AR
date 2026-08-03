@@ -8,14 +8,14 @@ Material:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_Name: M_Hydrangea_Petals_Random
-  m_Shader: {fileID: 4800000, guid: 3956f1dea0d23bd498449407d918460d, type: 3}
+  m_Shader: {fileID: 4800000, guid: 0caacdbf2d74498cb8424a1f46afc123, type: 3}
   m_Parent: {fileID: 0}
   m_ModifiedSerializedProperties: 0
   m_ValidKeywords: []
   m_InvalidKeywords: []
   m_LightmapFlags: 4
   m_EnableInstancingVariants: 0
-  m_DoubleSidedGI: 0
+  m_DoubleSidedGI: 1
   m_CustomRenderQueue: -1
   stringTagMap:
     RenderType: Opaque
@@ -50,9 +50,21 @@ Material:
         m_Offset: {x: 0, y: 0}
     m_Ints: []
     m_Floats:
+    - _AlphaClip: 0
+    - _BloomMaturity: 1
     - _BumpScale: 0.85
-    - _Smoothness: 0.35
+    - _Cull: 0
+    - _Cutoff: 0.5
+    - _DstBlend: 0
+    - _Smoothness: 1
+    - _SrcBlend: 1
+    - _Surface: 0
+    - _ZWrite: 1
     m_Colors:
     - _BaseColor: {r: 1, g: 1, b: 1, a: 1}
+    - _BudColorA: {r: 0.82, g: 0.88, b: 0.58, a: 1}
+    - _BudColorB: {r: 0.62, g: 0.78, b: 0.4, a: 1}
+    - _ColorA: {r: 0.43105882, g: 0.5286465, b: 0.9411765, a: 1}
+    - _ColorB: {r: 0.8152002, g: 0.47500002, b: 1, a: 1}
   m_BuildTextureStacks: []
   m_AllowLocking: 1
