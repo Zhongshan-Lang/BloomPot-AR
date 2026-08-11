@@ -9,6 +9,9 @@ Shader "BloomPot/Hydrangea Petal Random Lit"
         _BudColorA("Bud Yellow Green", Color) = (0.82, 0.88, 0.58, 1)
         _BudColorB("Bud Fresh Green", Color) = (0.62, 0.78, 0.40, 1)
         _BloomMaturity("Bloom Maturity", Range(0, 1)) = 1
+        _WiltColor("Wilt Yellow Tint", Color) = (0.95, 0.78, 0.32, 1)
+        _WiltAmount("Wilt Amount", Range(0, 1)) = 0
+        _WiltStrength("Wilt Tint Strength", Range(0, 0.5)) = 0.35
         [Normal] _BumpMap("Normal Map", 2D) = "bump" {}
         _BumpScale("Normal Strength", Range(0, 2)) = 0.85
         _RoughnessMap("Roughness Map", 2D) = "white" {}
@@ -66,6 +69,9 @@ Shader "BloomPot/Hydrangea Petal Random Lit"
                 half4 _BudColorA;
                 half4 _BudColorB;
                 half _BloomMaturity;
+                half4 _WiltColor;
+                half _WiltAmount;
+                half _WiltStrength;
                 half _BumpScale;
                 half _Smoothness;
                 half _Cutoff;
@@ -121,6 +127,10 @@ Shader "BloomPot/Hydrangea Petal Random Lit"
                 half3 matureTint = lerp(_ColorA.rgb, _ColorB.rgb, petalVariation);
                 half3 tint = lerp(budTint, matureTint, saturate(_BloomMaturity));
                 half3 albedo = baseSample.rgb * tint * _BaseColor.rgb;
+                half wilt = smoothstep(0.0h, 1.0h, saturate(_WiltAmount)) * saturate(_WiltStrength);
+                half luminance = dot(albedo, half3(0.299h, 0.587h, 0.114h));
+                half3 wiltAlbedo = max(luminance, 0.08h) * _WiltColor.rgb;
+                albedo = lerp(albedo, wiltAlbedo, wilt);
 
                 half3 normalTS = UnpackNormalScale(
                     SAMPLE_TEXTURE2D(_BumpMap, sampler_BumpMap, input.uv),

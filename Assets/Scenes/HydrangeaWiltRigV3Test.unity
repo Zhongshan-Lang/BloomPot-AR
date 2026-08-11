@@ -423,7 +423,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   _applyBlenderAxisFix: 0
-  _showDroopTestControls: 0
+  _showDroopTestControls: 1
   _wiltRigV3PivotData: {fileID: 4900000, guid: 969a7cefdac54d65883dfbfe866a750a, type: 3}
   _wiltTint: {r: 0.95, g: 0.78, b: 0.32, a: 1}
   _wiltTintStrength: 0.35
