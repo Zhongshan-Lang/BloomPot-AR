@@ -1,0 +1,680 @@
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public sealed class HydrangeaView : MonoBehaviour
+{
+    private const string PetalMaterialResourcePath = "HydrangeaInteractive/Materials/M_Hydrangea_Petals_Random";
+    private const string CenterMaterialResourcePath = "HydrangeaInteractive/Materials/M_Hydrangea_Centers";
+    private static readonly string[] ManagedBlendShapes = { "Sprout", "Leafing", "Bud", "HalfBloom", "Bloom" };
+    private static readonly int BaseColorProperty = Shader.PropertyToID("_BaseColor");
+    private static readonly int BloomMaturityProperty = Shader.PropertyToID("_BloomMaturity");
+    private static readonly int WiltAmountProperty = Shader.PropertyToID("_WiltAmount");
+    private static readonly int WiltColorProperty = Shader.PropertyToID("_WiltColor");
+
+    private readonly Dictionary<string, int> _blendShapeIndices = new Dictionary<string, int>();
+    private readonly PlantLifeAnimationController _lifeAnimationController =
+        new PlantLifeAnimationController();
+
+    private SkinnedMeshRenderer _renderer;
+    private HydrangeaDroopRigController _droopController;
+    private HydrangeaWiltRigV3Controller _wiltRigV3Controller;
+    private MaterialPropertyBlock _materialPropertyBlock;
+    private Coroutine _transitionRoutine;
+    private Coroutine _responseRoutine;
+    private Color[] _materialBaseColors = new Color[0];
+    private Color _wiltTint = new Color(0.95f, 0.78f, 0.32f, 1f);
+    private float _wiltTintStrength = 0.35f;
+    private float _currentBloomMaturity;
+    private float _requestedWilt;
+    private float _lastAppliedBloomMaturity = -1f;
+    private float _lastAppliedWiltAmount = -1f;
+    private int _fallbackBlendShapeIndex = -1;
+    private string _currentStageName;
+    private float _responseScale = 1f;
+    private float _responseRoll;
+    private float _lifeScale = 1f;
+    private Vector3 _lifeRotationEuler;
+
+    public bool IsReady => _renderer != null && CanPresentAnyStage();
+    public bool SupportsWilt => _droopController != null || _wiltRigV3Controller != null;
+    public string CurrentStageName => _currentStageName;
+    public float ResponseScale => _responseScale;
+    public float ResponseRoll => _responseRoll;
+    public float LifeScale => _lifeScale;
+    public Vector3 LifeRotationEuler => _lifeRotationEuler;
+
+    public bool Bind(
+        SkinnedMeshRenderer renderer,
+        HydrangeaDroopRigController droopController,
+        HydrangeaWiltRigV3Controller wiltRigV3Controller,
+        float initialWilt,
+        Color wiltTint,
+        float wiltTintStrength)
+    {
+        Unbind();
+        if (renderer == null || renderer.sharedMesh == null)
+        {
+            return false;
+        }
+
+        _renderer = renderer;
+        _droopController = droopController;
+        _wiltRigV3Controller = wiltRigV3Controller;
+        _wiltTint = wiltTint;
+        _wiltTintStrength = Mathf.Clamp(wiltTintStrength, 0f, 0.5f);
+
+        ConfigureRenderer();
+        ResolveBlendShapes();
+        if (!CanPresentAnyStage())
+        {
+            Unbind();
+            return false;
+        }
+
+        SetWiltImmediate(initialWilt);
+        ApplyInitialVisibleStage();
+        return true;
+    }
+
+    public void Unbind()
+    {
+        if (_transitionRoutine != null)
+        {
+            StopCoroutine(_transitionRoutine);
+            _transitionRoutine = null;
+        }
+
+        if (_responseRoutine != null)
+        {
+            StopCoroutine(_responseRoutine);
+            _responseRoutine = null;
+        }
+
+        _renderer = null;
+        _droopController = null;
+        _wiltRigV3Controller = null;
+        _blendShapeIndices.Clear();
+        _fallbackBlendShapeIndex = -1;
+        _currentStageName = null;
+        _currentBloomMaturity = 0f;
+        _requestedWilt = 0f;
+        _responseScale = 1f;
+        _responseRoll = 0f;
+        _lifeScale = 1f;
+        _lifeRotationEuler = Vector3.zero;
+        _lifeAnimationController.Reset();
+        ResetMaterialAppearanceCache();
+    }
+
+    public void Tick(bool allowLifeAnimation, float vitality)
+    {
+        var lifeFrame = _lifeAnimationController.Evaluate(
+            allowLifeAnimation && _transitionRoutine == null,
+            vitality,
+            Time.unscaledDeltaTime);
+        _lifeScale = lifeFrame.Scale;
+        _lifeRotationEuler = lifeFrame.RotationEuler;
+        ApplyMaterialAppearance(GetCurrentWiltAmount());
+    }
+
+    public void SetWiltTarget(float value01)
+    {
+        var wilt = Mathf.Clamp01(value01);
+        _requestedWilt = wilt;
+        _droopController?.SetDroopTarget(wilt);
+        _wiltRigV3Controller?.SetWiltTarget(wilt);
+    }
+
+    public void PlayInteractionResponse(float strength = 1f)
+    {
+        if (_renderer == null)
+        {
+            return;
+        }
+
+        if (_responseRoutine != null)
+        {
+            StopCoroutine(_responseRoutine);
+        }
+
+        _responseRoutine = StartCoroutine(AnimateInteractionResponse(Mathf.Clamp01(strength)));
+    }
+
+    public void SetWiltImmediate(float value01)
+    {
+        var wilt = Mathf.Clamp01(value01);
+        _requestedWilt = wilt;
+        _droopController?.SetDroop(wilt);
+        _wiltRigV3Controller?.SetWilt(wilt);
+        ApplyMaterialAppearance(GetCurrentWiltAmount(), true);
+    }
+
+    public void SetStage(string blendShapeName)
+    {
+        if (_renderer == null || !CanPresentStage(blendShapeName))
+        {
+            return;
+        }
+
+        if (_transitionRoutine != null)
+        {
+            StopCoroutine(_transitionRoutine);
+        }
+
+        var fromStageName = string.IsNullOrEmpty(_currentStageName) ? blendShapeName : _currentStageName;
+        _currentStageName = blendShapeName;
+        _transitionRoutine = StartCoroutine(AnimateStageChange(fromStageName, blendShapeName));
+    }
+
+    public bool SetStageImmediate(string blendShapeName)
+    {
+        if (_renderer == null || !CanPresentStage(blendShapeName))
+        {
+            return false;
+        }
+
+        if (_transitionRoutine != null)
+        {
+            StopCoroutine(_transitionRoutine);
+            _transitionRoutine = null;
+        }
+
+        _currentStageName = blendShapeName;
+        ApplyStageImmediately(blendShapeName);
+        return true;
+    }
+
+    public bool CanPresentStage(string stageName)
+    {
+        if (_renderer == null || _renderer.sharedMesh == null)
+        {
+            return false;
+        }
+
+        if (_blendShapeIndices.ContainsKey(stageName))
+        {
+            return true;
+        }
+
+        return stageName == "HalfBloom"
+            && _blendShapeIndices.ContainsKey("Bud")
+            && _blendShapeIndices.ContainsKey("Bloom");
+    }
+
+    private IEnumerator AnimateStageChange(string fromStageName, string blendShapeName)
+    {
+        var targetWeights = BuildTargetWeights(blendShapeName);
+        if (targetWeights == null)
+        {
+            yield break;
+        }
+
+        var rendererIndices = CollectRendererBlendShapeIndices();
+        var fromWeights = new Dictionary<int, float>();
+        foreach (var index in rendererIndices)
+        {
+            fromWeights[index] = _renderer.GetBlendShapeWeight(index);
+        }
+
+        const float duration = 0.35f;
+        var fromBloomMaturity = _currentBloomMaturity;
+        var targetBloomMaturity = GetBloomMaturity(blendShapeName);
+        var fromDroopStageScale = _droopController != null
+            ? new Vector2(_droopController.LeafStageScale, _droopController.HeadStageScale)
+            : Vector2.one;
+        var targetDroopStageScale = GetDroopStageScale(blendShapeName);
+        var elapsed = 0f;
+        while (elapsed < duration)
+        {
+            elapsed += Time.deltaTime;
+            var t = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(elapsed / duration));
+            foreach (var index in rendererIndices)
+            {
+                targetWeights.TryGetValue(index, out var targetWeight);
+                var weight = Mathf.Lerp(fromWeights[index], targetWeight, t);
+                _renderer.SetBlendShapeWeight(index, weight);
+            }
+
+            SetBloomMaturity(Mathf.Lerp(fromBloomMaturity, targetBloomMaturity, t));
+            SetDroopStageScale(Vector2.Lerp(fromDroopStageScale, targetDroopStageScale, t));
+            _wiltRigV3Controller?.SetGrowthTransition(fromStageName, blendShapeName, t);
+            yield return null;
+        }
+
+        ApplyStageImmediately(blendShapeName);
+        _transitionRoutine = null;
+    }
+
+    private IEnumerator AnimateInteractionResponse(float strength)
+    {
+        const float duration = 0.58f;
+        var elapsed = 0f;
+        while (elapsed < duration)
+        {
+            elapsed += Time.unscaledDeltaTime;
+            var t = Mathf.Clamp01(elapsed / duration);
+            var envelope = 1f - t;
+            _responseScale = 1f + Mathf.Sin(t * Mathf.PI) * 0.035f * strength;
+            _responseRoll = Mathf.Sin(t * Mathf.PI * 3f) * envelope * 2.2f * strength;
+            yield return null;
+        }
+
+        _responseScale = 1f;
+        _responseRoll = 0f;
+        _responseRoutine = null;
+    }
+
+    private void ApplyStageImmediately(string blendShapeName)
+    {
+        if (_renderer == null)
+        {
+            return;
+        }
+
+        var targetWeights = BuildTargetWeights(blendShapeName);
+        if (targetWeights == null)
+        {
+            return;
+        }
+
+        foreach (var index in CollectRendererBlendShapeIndices())
+        {
+            targetWeights.TryGetValue(index, out var targetWeight);
+            _renderer.SetBlendShapeWeight(index, targetWeight);
+        }
+
+        SetBloomMaturity(GetBloomMaturity(blendShapeName));
+        SetDroopStageScale(GetDroopStageScale(blendShapeName));
+        _wiltRigV3Controller?.SetGrowthStage(blendShapeName);
+    }
+
+    private void SetDroopStageScale(Vector2 stageScale)
+    {
+        _droopController?.SetStageScale(stageScale.x, stageScale.y);
+    }
+
+    private static Vector2 GetDroopStageScale(string stageName)
+    {
+        switch (stageName)
+        {
+            case "Sprout":
+                return Vector2.zero;
+            case "Leafing":
+                return new Vector2(0.4f, 0f);
+            case "Bud":
+                return new Vector2(0.7f, 0.55f);
+            case "HalfBloom":
+                return new Vector2(0.9f, 0.85f);
+            case "Bloom":
+                return Vector2.one;
+            default:
+                return Vector2.zero;
+        }
+    }
+
+    private void SetBloomMaturity(float maturity)
+    {
+        _currentBloomMaturity = Mathf.Clamp01(maturity);
+        ApplyMaterialAppearance(GetCurrentWiltAmount());
+    }
+
+    private float GetCurrentWiltAmount()
+    {
+        if (_wiltRigV3Controller != null)
+        {
+            return _wiltRigV3Controller.CurrentWilt;
+        }
+
+        if (_droopController != null)
+        {
+            return _droopController.CurrentDroop;
+        }
+
+        return _requestedWilt;
+    }
+
+    private void ConfigureRenderer()
+    {
+        _renderer.enabled = true;
+        _renderer.updateWhenOffscreen = true;
+        ApplyHydrangeaMaterialOverrides();
+        _renderer.SetPropertyBlock(null);
+        CacheMaterialBaseColors();
+        ApplyMaterialAppearance(GetCurrentWiltAmount(), true);
+
+        var meshBounds = _renderer.sharedMesh.bounds;
+        if (meshBounds.extents == Vector3.zero)
+        {
+            meshBounds = new Bounds(Vector3.zero, Vector3.one * 100f);
+        }
+
+        _renderer.localBounds = meshBounds;
+    }
+
+    private void ApplyHydrangeaMaterialOverrides()
+    {
+        var materials = _renderer.sharedMaterials;
+        if (materials.Length == 0)
+        {
+            return;
+        }
+
+        var petalMaterial = Resources.Load<Material>(PetalMaterialResourcePath);
+        if (petalMaterial == null)
+        {
+            Debug.LogError("HydrangeaView: petal material resource is missing.", this);
+            return;
+        }
+
+        var centerMaterial = Resources.Load<Material>(CenterMaterialResourcePath);
+        if (centerMaterial == null)
+        {
+            Debug.LogError("HydrangeaView: flower center material resource is missing.", this);
+            return;
+        }
+
+        var mesh = _renderer.sharedMesh;
+        var slotCount = Mathf.Min(materials.Length, mesh != null ? mesh.subMeshCount : materials.Length);
+        var petalSlots = new List<int>();
+        var centerSlots = new List<int>();
+        var genericFlowerSlots = new List<int>();
+
+        for (var i = 0; i < slotCount; i++)
+        {
+            var materialName = materials[i] != null ? materials[i].name.ToLowerInvariant() : string.Empty;
+            if (materialName.Contains("center"))
+            {
+                centerSlots.Add(i);
+            }
+            else if (materialName.Contains("petal"))
+            {
+                petalSlots.Add(i);
+            }
+            else if (materialName.Contains("flower"))
+            {
+                genericFlowerSlots.Add(i);
+            }
+        }
+
+        // Older material remaps gave both flower submeshes the same generic name.
+        foreach (var slot in genericFlowerSlots)
+        {
+            if (petalSlots.Count == 0)
+            {
+                petalSlots.Add(slot);
+            }
+            else if (centerSlots.Count == 0 && slotCount >= 4)
+            {
+                centerSlots.Add(slot);
+            }
+            else
+            {
+                petalSlots.Add(slot);
+            }
+        }
+
+        if (petalSlots.Count == 0 && slotCount >= 3)
+        {
+            petalSlots.Add(2);
+        }
+
+        if (centerSlots.Count == 0 && slotCount >= 4)
+        {
+            centerSlots.Add(3);
+        }
+
+        if (petalSlots.Count == 0)
+        {
+            Debug.LogWarning("HydrangeaView: no petal material slot was found; material override was skipped.", this);
+            return;
+        }
+
+        foreach (var slot in petalSlots)
+        {
+            materials[slot] = petalMaterial;
+        }
+
+        foreach (var slot in centerSlots)
+        {
+            materials[slot] = centerMaterial;
+        }
+
+        _renderer.sharedMaterials = materials;
+        Debug.Log(
+            $"HydrangeaView: applied petal material to slot(s) {string.Join(", ", petalSlots)} " +
+            $"and center material to slot(s) {string.Join(", ", centerSlots)}.",
+            this);
+    }
+
+    private void CacheMaterialBaseColors()
+    {
+        var materials = _renderer != null ? _renderer.sharedMaterials : new Material[0];
+        _materialBaseColors = new Color[materials.Length];
+        for (var i = 0; i < materials.Length; i++)
+        {
+            var material = materials[i];
+            _materialBaseColors[i] = material != null && material.HasProperty(BaseColorProperty)
+                ? material.GetColor(BaseColorProperty)
+                : Color.white;
+        }
+
+        _lastAppliedBloomMaturity = -1f;
+        _lastAppliedWiltAmount = -1f;
+    }
+
+    private void ApplyMaterialAppearance(float wiltAmount, bool force = false)
+    {
+        if (_renderer == null)
+        {
+            return;
+        }
+
+        var materials = _renderer.sharedMaterials;
+        if (_materialBaseColors.Length != materials.Length)
+        {
+            CacheMaterialBaseColors();
+        }
+
+        var clampedWilt = Mathf.Clamp01(wiltAmount);
+        if (!force
+            && Mathf.Abs(_lastAppliedWiltAmount - clampedWilt) < 0.0001f
+            && Mathf.Abs(_lastAppliedBloomMaturity - _currentBloomMaturity) < 0.0001f)
+        {
+            return;
+        }
+
+        var smoothWilt = Mathf.SmoothStep(0f, 1f, clampedWilt);
+        var tintAmount = smoothWilt * _wiltTintStrength;
+        var standardMaterialMultiplier = Color.Lerp(Color.white, _wiltTint, tintAmount);
+        _materialPropertyBlock ??= new MaterialPropertyBlock();
+
+        for (var i = 0; i < materials.Length; i++)
+        {
+            var material = materials[i];
+            if (material == null)
+            {
+                continue;
+            }
+
+            _materialPropertyBlock.Clear();
+            _renderer.GetPropertyBlock(_materialPropertyBlock, i);
+            _materialPropertyBlock.SetFloat(BloomMaturityProperty, _currentBloomMaturity);
+            _materialPropertyBlock.SetFloat(WiltAmountProperty, smoothWilt);
+            _materialPropertyBlock.SetColor(WiltColorProperty, _wiltTint);
+
+            if (material.HasProperty(BaseColorProperty))
+            {
+                var baseColor = _materialBaseColors[i];
+                if (!material.HasProperty(WiltAmountProperty))
+                {
+                    baseColor = new Color(
+                        baseColor.r * standardMaterialMultiplier.r,
+                        baseColor.g * standardMaterialMultiplier.g,
+                        baseColor.b * standardMaterialMultiplier.b,
+                        baseColor.a);
+                }
+
+                _materialPropertyBlock.SetColor(BaseColorProperty, baseColor);
+            }
+
+            _renderer.SetPropertyBlock(_materialPropertyBlock, i);
+        }
+
+        _lastAppliedBloomMaturity = _currentBloomMaturity;
+        _lastAppliedWiltAmount = clampedWilt;
+    }
+
+    private void ResetMaterialAppearanceCache()
+    {
+        _materialBaseColors = new Color[0];
+        _lastAppliedBloomMaturity = -1f;
+        _lastAppliedWiltAmount = -1f;
+    }
+
+    private void ResolveBlendShapes()
+    {
+        _blendShapeIndices.Clear();
+        _fallbackBlendShapeIndex = -1;
+        if (_renderer == null || _renderer.sharedMesh == null)
+        {
+            return;
+        }
+
+        if (_renderer.sharedMesh.blendShapeCount > 0)
+        {
+            _fallbackBlendShapeIndex = 0;
+        }
+
+        foreach (var blendShapeName in ManagedBlendShapes)
+        {
+            var index = ResolveBlendShapeIndex(blendShapeName);
+            if (index >= 0)
+            {
+                _blendShapeIndices[blendShapeName] = index;
+            }
+        }
+    }
+
+    private void ApplyInitialVisibleStage()
+    {
+        if (_renderer == null || _renderer.sharedMesh == null)
+        {
+            return;
+        }
+
+        if (_blendShapeIndices.ContainsKey("Bud"))
+        {
+            _currentStageName = "Bud";
+            ApplyStageImmediately("Bud");
+            return;
+        }
+
+        if (_fallbackBlendShapeIndex < 0)
+        {
+            return;
+        }
+
+        for (var i = 0; i < _renderer.sharedMesh.blendShapeCount; i++)
+        {
+            _renderer.SetBlendShapeWeight(i, i == _fallbackBlendShapeIndex ? 100f : 0f);
+        }
+
+        SetBloomMaturity(GetBloomMaturity("Bud"));
+        SetDroopStageScale(GetDroopStageScale("Bud"));
+        Debug.Log(
+            $"HydrangeaView: Bud blend shape was not found, using fallback blend shape index " +
+            $"{_fallbackBlendShapeIndex} ({_renderer.sharedMesh.GetBlendShapeName(_fallbackBlendShapeIndex)}).",
+            this);
+    }
+
+    private int ResolveBlendShapeIndex(string canonicalStageName)
+    {
+        if (_renderer == null || _renderer.sharedMesh == null)
+        {
+            return -1;
+        }
+
+        var directIndex = _renderer.sharedMesh.GetBlendShapeIndex(canonicalStageName);
+        if (directIndex >= 0)
+        {
+            return directIndex;
+        }
+
+        var canonicalLower = canonicalStageName.ToLowerInvariant();
+        for (var i = 0; i < _renderer.sharedMesh.blendShapeCount; i++)
+        {
+            var actualName = _renderer.sharedMesh.GetBlendShapeName(i).ToLowerInvariant();
+            if (actualName.Contains(canonicalLower))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private bool CanPresentAnyStage()
+    {
+        foreach (var stageName in ManagedBlendShapes)
+        {
+            if (CanPresentStage(stageName))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private Dictionary<int, float> BuildTargetWeights(string stageName)
+    {
+        if (_renderer == null || _renderer.sharedMesh == null)
+        {
+            return null;
+        }
+
+        var result = new Dictionary<int, float>();
+        if (_blendShapeIndices.TryGetValue(stageName, out var directIndex))
+        {
+            result[directIndex] = 100f;
+            return result;
+        }
+
+        if (stageName == "HalfBloom"
+            && _blendShapeIndices.TryGetValue("Bud", out var budIndex)
+            && _blendShapeIndices.TryGetValue("Bloom", out var bloomIndex))
+        {
+            result[budIndex] = 40f;
+            result[bloomIndex] = 60f;
+            return result;
+        }
+
+        return null;
+    }
+
+    private List<int> CollectRendererBlendShapeIndices()
+    {
+        return _blendShapeIndices.Values
+            .Distinct()
+            .OrderBy(index => index)
+            .ToList();
+    }
+
+    private static float GetBloomMaturity(string stageName)
+    {
+        switch (stageName)
+        {
+            case "Bud":
+                return 0.05f;
+            case "HalfBloom":
+                return 0.52f;
+            case "Bloom":
+                return 1f;
+            default:
+                return 0f;
+        }
+    }
+}

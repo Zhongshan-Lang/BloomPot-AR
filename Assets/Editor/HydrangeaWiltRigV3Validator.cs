@@ -315,11 +315,66 @@ public static class HydrangeaWiltRigV3Validator
             var restored = CaptureLocalMatrices(renderer.bones);
             Require(MaxMatrixDifference(baseline, restored) < 0.0001f,
                 "Wilt 1 to 0 did not restore the bind pose within tolerance.");
+
+            ValidateHydrangeaView(instance, renderer, controller);
         }
         finally
         {
             UnityEngine.Object.DestroyImmediate(instance);
         }
+    }
+
+    private static void ValidateHydrangeaView(
+        GameObject instance,
+        SkinnedMeshRenderer renderer,
+        HydrangeaWiltRigV3Controller controller)
+    {
+        var view = instance.AddComponent<HydrangeaView>();
+        Require(
+            view.Bind(
+                renderer,
+                null,
+                controller,
+                0f,
+                new Color(0.95f, 0.78f, 0.32f, 1f),
+                0.35f),
+            "HydrangeaView failed to bind the validated v3 renderer.");
+        Require(view.IsReady, "HydrangeaView did not report ready after binding.");
+        Require(view.SupportsWilt, "HydrangeaView did not expose v3 wilt support.");
+        Require(view.CurrentStageName == "Bud", "HydrangeaView did not initialize to Bud.");
+
+        foreach (var stage in ExpectedBlendShapes)
+        {
+            Require(view.SetStageImmediate(stage), $"HydrangeaView rejected stage '{stage}'.");
+            Require(view.CurrentStageName == stage, $"HydrangeaView did not retain stage '{stage}'.");
+            for (var index = 0; index < renderer.sharedMesh.blendShapeCount; index++)
+            {
+                var expectedWeight = renderer.sharedMesh.GetBlendShapeName(index) == stage ? 100f : 0f;
+                Require(
+                    Mathf.Abs(renderer.GetBlendShapeWeight(index) - expectedWeight) < 0.001f,
+                    $"HydrangeaView applied an unexpected Blend Shape weight for '{stage}'.");
+            }
+        }
+
+        var propertyBlock = new MaterialPropertyBlock();
+        view.SetWiltImmediate(0f);
+        renderer.GetPropertyBlock(propertyBlock, 0);
+        var healthyColor = propertyBlock.GetColor("_BaseColor");
+        view.SetWiltImmediate(1f);
+        propertyBlock.Clear();
+        renderer.GetPropertyBlock(propertyBlock, 0);
+        var wiltedColor = propertyBlock.GetColor("_BaseColor");
+        Require(
+            wiltedColor.b < healthyColor.b,
+            "HydrangeaView did not apply the expected warm wilt tint.");
+
+        view.SetWiltImmediate(0f);
+        propertyBlock.Clear();
+        renderer.GetPropertyBlock(propertyBlock, 0);
+        var restoredColor = propertyBlock.GetColor("_BaseColor");
+        Require(
+            Vector4.Distance(healthyColor, restoredColor) < 0.0001f,
+            "HydrangeaView did not restore the healthy material color.");
     }
 
     private static void ValidateBakedGeometry(
