@@ -43,8 +43,8 @@ public static class PlantGrowthValidator
         var longInactive = CreateState(now.AddDays(-100), now.AddDays(-100), 1f);
         var longResult = controller.ApplyOfflineProgress(longInactive, now);
         Require(
-            Mathf.Approximately(longInactive.vitality, PlantGrowthController.MinimumVitality),
-            "Long inactivity went below the non-punitive vitality floor.");
+            Mathf.Approximately(longInactive.vitality, 0f),
+            "Long-term companion vitality did not continue below 35% to zero.");
         Require(
             Mathf.Abs(longResult.WiltAmount - PlantGrowthController.MaximumCompanionWilt) < 0.0001f,
             "Long inactivity did not clamp to the companion wilt maximum.");
@@ -56,34 +56,58 @@ public static class PlantGrowthValidator
         var demoController = new PlantGrowthController(PlantExperienceProfile.PortfolioDemo);
         var demoState = CreateState(now, now, 1f);
         demoController.ResetRealtime(now);
-        demoController.ApplyRealtimeProgress(demoState, now.AddSeconds(4d));
-        Require(Mathf.Approximately(demoState.vitality, 1f), "Demo vitality changed during its five-second grace period.");
-        demoController.ApplyRealtimeProgress(demoState, now.AddSeconds(10d));
-        Require(Mathf.Abs(demoState.vitality - 0.9f) < 0.0001f, "Demo ten-second vitality was not 90%.");
-        demoController.ApplyRealtimeProgress(demoState, now.AddSeconds(25d));
-        Require(Mathf.Abs(demoState.vitality - 0.6f) < 0.0001f, "Demo twenty-five-second vitality was not 60%.");
+        demoController.ApplyRealtimeProgress(demoState, now.AddSeconds(9d));
+        Require(Mathf.Approximately(demoState.vitality, 1f), "Demo vitality changed during its ten-second grace period.");
+        demoController.ApplyRealtimeProgress(demoState, now.AddSeconds(20d));
+        Require(Mathf.Abs(demoState.vitality - 0.9f) < 0.0001f, "Demo twenty-second vitality was not 90%.");
+        demoController.ApplyRealtimeProgress(demoState, now.AddSeconds(50d));
+        Require(Mathf.Abs(demoState.vitality - 0.6f) < 0.0001f, "Demo fifty-second vitality was not 60%.");
 
-        demoState.lastInteractionUtc = PlantState.FormatUtc(now.AddSeconds(25d));
-        demoController.ApplyRealtimeProgress(demoState, now.AddSeconds(29d));
+        demoState.lastInteractionUtc = PlantState.FormatUtc(now.AddSeconds(50d));
+        demoController.ApplyRealtimeProgress(demoState, now.AddSeconds(59d));
         Require(Mathf.Abs(demoState.vitality - 0.6f) < 0.0001f, "A demo interaction did not restart the grace period.");
+        demoController.ApplyRealtimeProgress(demoState, now.AddSeconds(120d));
+        Require(Mathf.Approximately(demoState.vitality, 0f), "Demo vitality did not continue below 35% to zero.");
 
         for (var index = 0; index <= 100; index++)
         {
             var vitality = index / 100f;
             var wilt = controller.CalculateWilt(vitality);
+            var appearanceDecay = controller.CalculateAppearanceDecay(vitality);
             Require(
                 wilt >= 0f && wilt <= PlantGrowthController.MaximumCompanionWilt,
                 "Wilt mapping left its supported range.");
+            Require(
+                appearanceDecay >= 0f && appearanceDecay <= 1f,
+                "Appearance decay mapping left its supported range.");
         }
+
+        Require(
+            Mathf.Approximately(
+                controller.CalculateWilt(PlantGrowthController.FullWiltVitalityThreshold),
+                controller.CalculateWilt(0f)),
+            "Wilt deformation did not remain clamped below 25% vitality.");
+        Require(
+            Mathf.Abs(controller.CalculateWilt(0f) - 0.99f) < 0.0001f,
+            "Companion wilt did not reach the increased 0.99 maximum.");
+        Require(
+            Mathf.Abs(
+                controller.CalculateAppearanceDecay(
+                    PlantGrowthController.CriticalAppearanceVitalityThreshold)
+                - PlantGrowthController.AppearanceDecayAtCriticalThreshold) < 0.0001f,
+            "Appearance decay did not preserve the existing value at 35% vitality.");
+        Require(
+            Mathf.Approximately(controller.CalculateAppearanceDecay(0f), 1f),
+            "Appearance decay did not reach full strength at zero vitality.");
 
         return
             "PLANT_GROWTH_VALIDATION: PASS\n" +
             "gracePeriod: PASS\n" +
             "incrementalOfflineDecay: PASS\n" +
-            "nonPunitiveFloor: PASS\n" +
+            "fullVitalityRange: PASS\n" +
             "clockRollback: PASS\n" +
             "portfolioDemoTimeline: PASS\n" +
-            "wiltMapping: PASS";
+            "wiltAndAppearanceMapping: PASS";
     }
 
     private static PlantState CreateState(

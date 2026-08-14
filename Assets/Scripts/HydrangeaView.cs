@@ -13,6 +13,10 @@ public sealed class HydrangeaView : MonoBehaviour
     private static readonly int BloomMaturityProperty = Shader.PropertyToID("_BloomMaturity");
     private static readonly int WiltAmountProperty = Shader.PropertyToID("_WiltAmount");
     private static readonly int WiltColorProperty = Shader.PropertyToID("_WiltColor");
+    private static readonly int WiltStrengthProperty = Shader.PropertyToID("_WiltStrength");
+    private static readonly int WiltBrightnessProperty = Shader.PropertyToID("_WiltBrightness");
+    private const float MaximumCriticalWiltTintStrength = 0.85f;
+    private const float MinimumCriticalWiltBrightness = 0.58f;
 
     private readonly Dictionary<string, int> _blendShapeIndices = new Dictionary<string, int>();
     private readonly PlantLifeAnimationController _lifeAnimationController =
@@ -29,8 +33,9 @@ public sealed class HydrangeaView : MonoBehaviour
     private float _wiltTintStrength = 0.35f;
     private float _currentBloomMaturity;
     private float _requestedWilt;
+    private float _appearanceDecay;
     private float _lastAppliedBloomMaturity = -1f;
-    private float _lastAppliedWiltAmount = -1f;
+    private float _lastAppliedAppearanceDecay = -1f;
     private int _fallbackBlendShapeIndex = -1;
     private string _currentStageName;
     private float _responseScale = 1f;
@@ -51,6 +56,7 @@ public sealed class HydrangeaView : MonoBehaviour
         HydrangeaDroopRigController droopController,
         HydrangeaWiltRigV3Controller wiltRigV3Controller,
         float initialWilt,
+        float initialAppearanceDecay,
         Color wiltTint,
         float wiltTintStrength)
     {
@@ -65,6 +71,7 @@ public sealed class HydrangeaView : MonoBehaviour
         _wiltRigV3Controller = wiltRigV3Controller;
         _wiltTint = wiltTint;
         _wiltTintStrength = Mathf.Clamp(wiltTintStrength, 0f, 0.5f);
+        _appearanceDecay = Mathf.Clamp01(initialAppearanceDecay);
 
         ConfigureRenderer();
         ResolveBlendShapes();
@@ -101,6 +108,7 @@ public sealed class HydrangeaView : MonoBehaviour
         _currentStageName = null;
         _currentBloomMaturity = 0f;
         _requestedWilt = 0f;
+        _appearanceDecay = 0f;
         _responseScale = 1f;
         _responseRoll = 0f;
         _lifeScale = 1f;
@@ -109,7 +117,7 @@ public sealed class HydrangeaView : MonoBehaviour
         ResetMaterialAppearanceCache();
     }
 
-    public void Tick(bool allowLifeAnimation, float vitality)
+    public void Tick(bool allowLifeAnimation, float vitality, float appearanceDecay)
     {
         var lifeFrame = _lifeAnimationController.Evaluate(
             allowLifeAnimation && _transitionRoutine == null,
@@ -117,7 +125,8 @@ public sealed class HydrangeaView : MonoBehaviour
             Time.unscaledDeltaTime);
         _lifeScale = lifeFrame.Scale;
         _lifeRotationEuler = lifeFrame.RotationEuler;
-        ApplyMaterialAppearance(GetCurrentWiltAmount());
+        _appearanceDecay = Mathf.Clamp01(appearanceDecay);
+        ApplyMaterialAppearance(_appearanceDecay);
     }
 
     public void SetWiltTarget(float value01)
@@ -149,7 +158,13 @@ public sealed class HydrangeaView : MonoBehaviour
         _requestedWilt = wilt;
         _droopController?.SetDroop(wilt);
         _wiltRigV3Controller?.SetWilt(wilt);
-        ApplyMaterialAppearance(GetCurrentWiltAmount(), true);
+        ApplyMaterialAppearance(_appearanceDecay, true);
+    }
+
+    public void SetAppearanceDecayImmediate(float value01)
+    {
+        _appearanceDecay = Mathf.Clamp01(value01);
+        ApplyMaterialAppearance(_appearanceDecay, true);
     }
 
     public void SetStage(string blendShapeName)
@@ -318,22 +333,7 @@ public sealed class HydrangeaView : MonoBehaviour
     private void SetBloomMaturity(float maturity)
     {
         _currentBloomMaturity = Mathf.Clamp01(maturity);
-        ApplyMaterialAppearance(GetCurrentWiltAmount());
-    }
-
-    private float GetCurrentWiltAmount()
-    {
-        if (_wiltRigV3Controller != null)
-        {
-            return _wiltRigV3Controller.CurrentWilt;
-        }
-
-        if (_droopController != null)
-        {
-            return _droopController.CurrentDroop;
-        }
-
-        return _requestedWilt;
+        ApplyMaterialAppearance(_appearanceDecay);
     }
 
     private void ConfigureRenderer()
@@ -343,7 +343,7 @@ public sealed class HydrangeaView : MonoBehaviour
         ApplyHydrangeaMaterialOverrides();
         _renderer.SetPropertyBlock(null);
         CacheMaterialBaseColors();
-        ApplyMaterialAppearance(GetCurrentWiltAmount(), true);
+        ApplyMaterialAppearance(_appearanceDecay, true);
 
         var meshBounds = _renderer.sharedMesh.bounds;
         if (meshBounds.extents == Vector3.zero)
@@ -462,10 +462,10 @@ public sealed class HydrangeaView : MonoBehaviour
         }
 
         _lastAppliedBloomMaturity = -1f;
-        _lastAppliedWiltAmount = -1f;
+        _lastAppliedAppearanceDecay = -1f;
     }
 
-    private void ApplyMaterialAppearance(float wiltAmount, bool force = false)
+    private void ApplyMaterialAppearance(float appearanceDecay, bool force = false)
     {
         if (_renderer == null)
         {
@@ -478,16 +478,29 @@ public sealed class HydrangeaView : MonoBehaviour
             CacheMaterialBaseColors();
         }
 
-        var clampedWilt = Mathf.Clamp01(wiltAmount);
+        var clampedDecay = Mathf.Clamp01(appearanceDecay);
         if (!force
-            && Mathf.Abs(_lastAppliedWiltAmount - clampedWilt) < 0.0001f
+            && Mathf.Abs(_lastAppliedAppearanceDecay - clampedDecay) < 0.0001f
             && Mathf.Abs(_lastAppliedBloomMaturity - _currentBloomMaturity) < 0.0001f)
         {
             return;
         }
 
-        var smoothWilt = Mathf.SmoothStep(0f, 1f, clampedWilt);
-        var tintAmount = smoothWilt * _wiltTintStrength;
+        var smoothWilt = Mathf.SmoothStep(0f, 1f, clampedDecay);
+        var criticalProgress = Mathf.InverseLerp(
+            PlantGrowthController.AppearanceDecayAtCriticalThreshold,
+            1f,
+            clampedDecay);
+        var smoothCriticalProgress = Mathf.SmoothStep(0f, 1f, criticalProgress);
+        var criticalTintStrength = Mathf.Lerp(
+            _wiltTintStrength,
+            MaximumCriticalWiltTintStrength,
+            smoothCriticalProgress);
+        var criticalBrightness = Mathf.Lerp(
+            1f,
+            MinimumCriticalWiltBrightness,
+            smoothCriticalProgress);
+        var tintAmount = smoothWilt * criticalTintStrength;
         var standardMaterialMultiplier = Color.Lerp(Color.white, _wiltTint, tintAmount);
         _materialPropertyBlock ??= new MaterialPropertyBlock();
 
@@ -504,6 +517,15 @@ public sealed class HydrangeaView : MonoBehaviour
             _materialPropertyBlock.SetFloat(BloomMaturityProperty, _currentBloomMaturity);
             _materialPropertyBlock.SetFloat(WiltAmountProperty, smoothWilt);
             _materialPropertyBlock.SetColor(WiltColorProperty, _wiltTint);
+            if (material.HasProperty(WiltStrengthProperty))
+            {
+                _materialPropertyBlock.SetFloat(WiltStrengthProperty, criticalTintStrength);
+            }
+
+            if (material.HasProperty(WiltBrightnessProperty))
+            {
+                _materialPropertyBlock.SetFloat(WiltBrightnessProperty, criticalBrightness);
+            }
 
             if (material.HasProperty(BaseColorProperty))
             {
@@ -511,9 +533,9 @@ public sealed class HydrangeaView : MonoBehaviour
                 if (!material.HasProperty(WiltAmountProperty))
                 {
                     baseColor = new Color(
-                        baseColor.r * standardMaterialMultiplier.r,
-                        baseColor.g * standardMaterialMultiplier.g,
-                        baseColor.b * standardMaterialMultiplier.b,
+                        baseColor.r * standardMaterialMultiplier.r * criticalBrightness,
+                        baseColor.g * standardMaterialMultiplier.g * criticalBrightness,
+                        baseColor.b * standardMaterialMultiplier.b * criticalBrightness,
                         baseColor.a);
                 }
 
@@ -524,14 +546,14 @@ public sealed class HydrangeaView : MonoBehaviour
         }
 
         _lastAppliedBloomMaturity = _currentBloomMaturity;
-        _lastAppliedWiltAmount = clampedWilt;
+        _lastAppliedAppearanceDecay = clampedDecay;
     }
 
     private void ResetMaterialAppearanceCache()
     {
         _materialBaseColors = new Color[0];
         _lastAppliedBloomMaturity = -1f;
-        _lastAppliedWiltAmount = -1f;
+        _lastAppliedAppearanceDecay = -1f;
     }
 
     private void ResolveBlendShapes()

@@ -5,9 +5,11 @@ public sealed class PlantGrowthController
 {
     public const double InactivityGraceHours = 12d;
     public const float VitalityLossPerDay = 0.08f;
-    public const float MinimumVitality = 0.35f;
+    public const float FullWiltVitalityThreshold = 0.25f;
+    public const float CriticalAppearanceVitalityThreshold = 0.35f;
     public const float HealthyVitalityThreshold = 0.85f;
-    public const float MaximumCompanionWilt = 0.45f;
+    public const float MaximumCompanionWilt = 0.99f;
+    public const float AppearanceDecayAtCriticalThreshold = 0.45f;
     public const double MaximumOfflineDaysPerEvaluation = 30d;
 
     private readonly PlantExperienceProfile _profile;
@@ -50,7 +52,7 @@ public sealed class PlantGrowthController
         if (evaluatedSeconds > 0d)
         {
             var vitalityLoss = (float)evaluatedSeconds * _profile.VitalityLossPerSecond;
-            state.vitality = Mathf.Max(MinimumVitality, state.vitality - vitalityLoss);
+            state.vitality = Mathf.Max(_profile.MinimumVitality, state.vitality - vitalityLoss);
         }
 
         return new PlantGrowthResult(
@@ -86,7 +88,7 @@ public sealed class PlantGrowthController
         if (_profile.UsesRealtimeDecay && evaluatedSeconds > 0d)
         {
             var vitalityLoss = (float)evaluatedSeconds * _profile.VitalityLossPerSecond;
-            state.vitality = Mathf.Max(MinimumVitality, state.vitality - vitalityLoss);
+            state.vitality = Mathf.Max(_profile.MinimumVitality, state.vitality - vitalityLoss);
         }
 
         return new PlantGrowthResult(
@@ -109,9 +111,36 @@ public sealed class PlantGrowthController
             return 0f;
         }
 
-        var vitalityRange = HealthyVitalityThreshold - MinimumVitality;
+        var vitalityRange = HealthyVitalityThreshold - FullWiltVitalityThreshold;
         var depleted = (HealthyVitalityThreshold - normalizedVitality) / vitalityRange;
         return Mathf.SmoothStep(0f, MaximumCompanionWilt, Mathf.Clamp01(depleted));
+    }
+
+    public float CalculateAppearanceDecay(float vitality)
+    {
+        var normalizedVitality = Mathf.Clamp01(vitality);
+        if (normalizedVitality >= HealthyVitalityThreshold)
+        {
+            return 0f;
+        }
+
+        if (normalizedVitality >= CriticalAppearanceVitalityThreshold)
+        {
+            var wiltRange = HealthyVitalityThreshold - CriticalAppearanceVitalityThreshold;
+            var depleted = (HealthyVitalityThreshold - normalizedVitality) / wiltRange;
+            return Mathf.SmoothStep(
+                0f,
+                AppearanceDecayAtCriticalThreshold,
+                Mathf.Clamp01(depleted));
+        }
+
+        var criticalDepletion =
+            (CriticalAppearanceVitalityThreshold - normalizedVitality)
+            / CriticalAppearanceVitalityThreshold;
+        return Mathf.Lerp(
+            AppearanceDecayAtCriticalThreshold,
+            1f,
+            Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(criticalDepletion)));
     }
 
     private static DateTime EnsureUtc(DateTime value)

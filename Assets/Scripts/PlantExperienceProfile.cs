@@ -21,7 +21,8 @@ public sealed class PlantExperienceProfile
         TimeSpan visitRewardInterval,
         TimeSpan interactionLimitWindow,
         bool usesUtcDailyInteractionReset,
-        bool usesRealtimeDecay)
+        bool usesRealtimeDecay,
+        float minimumVitality)
     {
         Mode = mode;
         DisplayName = displayName;
@@ -33,6 +34,7 @@ public sealed class PlantExperienceProfile
         InteractionLimitWindow = interactionLimitWindow;
         UsesUtcDailyInteractionReset = usesUtcDailyInteractionReset;
         UsesRealtimeDecay = usesRealtimeDecay;
+        MinimumVitality = minimumVitality;
     }
 
     public PlantExperienceMode Mode { get; }
@@ -45,6 +47,7 @@ public sealed class PlantExperienceProfile
     public TimeSpan InteractionLimitWindow { get; }
     public bool UsesUtcDailyInteractionReset { get; }
     public bool UsesRealtimeDecay { get; }
+    public float MinimumVitality { get; }
     public bool IsPortfolioDemo => Mode == PlantExperienceMode.PortfolioDemo;
 
     public static PlantExperienceProfile Companion { get; } = new PlantExperienceProfile(
@@ -57,19 +60,21 @@ public sealed class PlantExperienceProfile
         TimeSpan.FromHours(4d),
         TimeSpan.FromDays(1d),
         true,
-        false);
+        false,
+        0f);
 
     public static PlantExperienceProfile PortfolioDemo { get; } = new PlantExperienceProfile(
         PlantExperienceMode.PortfolioDemo,
         "\u4f5c\u54c1\u96c6\u6f14\u793a",
         "plant-state-demo.json",
-        TimeSpan.FromSeconds(5d),
-        0.02f,
-        TimeSpan.FromSeconds(60d),
+        TimeSpan.FromSeconds(10d),
+        0.01f,
+        TimeSpan.FromSeconds(120d),
         TimeSpan.FromSeconds(20d),
         TimeSpan.FromSeconds(60d),
         false,
-        true);
+        true,
+        0f);
 
     public static PlantExperienceProfile ResolveCurrent()
     {

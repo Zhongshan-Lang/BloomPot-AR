@@ -47,6 +47,8 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     private PlantInteractionController _plantInteractionController;
     private Text _statusText;
     private UIImage _vitalityFillImage;
+    private Slider _vitalitySlider;
+    private UIImage _vitalitySliderHandleImage;
     private Text _vitalityValueText;
     private RectTransform _vitalityHudRect;
     private Text _experienceModeText;
@@ -102,9 +104,13 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         UpdateVitalityHudSafeArea();
         var modelReady = _view != null && _view.IsReady;
         var vitality = _plantState != null ? _plantState.vitality : 1f;
+        var appearanceDecay = ShouldShowDroopTestControls
+            ? _requestedDroopLevel
+            : CalculateCurrentAppearanceDecay();
         _view.Tick(
             tracked && modelReady && !ShouldShowDroopTestControls,
-            vitality);
+            vitality,
+            appearanceDecay);
         RefreshUiState(tracked);
         UpdatePlacementAnimation(tracked);
     }
@@ -126,12 +132,20 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     {
         _requestedDroopLevel = Mathf.Clamp01(value01);
         _view?.SetWiltTarget(_requestedDroopLevel);
+        if (ShouldShowDroopTestControls)
+        {
+            _view?.SetAppearanceDecayImmediate(_requestedDroopLevel);
+        }
     }
 
     public void SetDroopLevelImmediate(float value01)
     {
         _requestedDroopLevel = Mathf.Clamp01(value01);
         _view?.SetWiltImmediate(_requestedDroopLevel);
+        if (ShouldShowDroopTestControls)
+        {
+            _view?.SetAppearanceDecayImmediate(_requestedDroopLevel);
+        }
     }
 
     public void RestoreDroop()
@@ -239,6 +253,34 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         _visitRegisteredForCurrentTrackingSession = false;
         ApplyCompanionStateToView();
         SavePersistentState();
+    }
+
+    private void SetDemoVitality(float vitality)
+    {
+        if (_experienceProfile == null
+            || !_experienceProfile.IsPortfolioDemo
+            || _plantState == null
+            || _plantGrowthController == null)
+        {
+            return;
+        }
+
+        var now = System.DateTime.UtcNow;
+        _plantState.vitality = Mathf.Clamp01(vitality);
+        _plantState.lastInteractionUtc = PlantState.FormatUtc(now);
+        _plantGrowthController.ResetRealtime(now);
+        _trackedVisitDuration = 0f;
+        _visitRegisteredForCurrentTrackingSession = IsTracked();
+
+        var wiltTarget = _plantGrowthController.CalculateWilt(_plantState.vitality);
+        if (!Mathf.Approximately(_requestedDroopLevel, wiltTarget))
+        {
+            _requestedDroopLevel = wiltTarget;
+            _view?.SetWiltTarget(_requestedDroopLevel);
+        }
+
+        _hasUiStateSnapshot = false;
+        RefreshUiState(IsTracked());
     }
 
     private void EnsureModelInstance()
@@ -510,6 +552,13 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         _requestedDroopLevel = _plantGrowthController.CalculateWilt(_plantState.vitality);
         _view?.SetWiltTarget(_requestedDroopLevel);
         _hasUiStateSnapshot = false;
+    }
+
+    private float CalculateCurrentAppearanceDecay()
+    {
+        return _plantGrowthController != null && _plantState != null
+            ? _plantGrowthController.CalculateAppearanceDecay(_plantState.vitality)
+            : 0f;
     }
 
     private static bool TryGetCompanionTapPosition(out Vector2 screenPosition)
@@ -795,6 +844,20 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             _vitalityFillImage = fillObject.AddComponent<UIImage>();
             _vitalityFillImage.raycastTarget = false;
 
+            var handleObject = CreateUiObject("Handle", backgroundObject.transform);
+            var handleRect = handleObject.GetComponent<RectTransform>();
+            handleRect.sizeDelta = new Vector2(28f, 40f);
+            _vitalitySliderHandleImage = handleObject.AddComponent<UIImage>();
+            _vitalitySliderHandleImage.color = new Color(0.96f, 0.95f, 0.84f, 1f);
+
+            _vitalitySlider = backgroundObject.AddComponent<Slider>();
+            _vitalitySlider.minValue = 0f;
+            _vitalitySlider.maxValue = 1f;
+            _vitalitySlider.direction = Slider.Direction.LeftToRight;
+            _vitalitySlider.fillRect = fillRect;
+            _vitalitySlider.handleRect = handleRect;
+            _vitalitySlider.targetGraphic = _vitalitySliderHandleImage;
+
             var valueObject = CreateUiObject("Value", vitalityHud);
             var valueRect = valueObject.GetComponent<RectTransform>();
             valueRect.anchorMin = new Vector2(0.5f, 0.48f);
@@ -838,16 +901,20 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             vitalityHud.gameObject.SetActive(true);
             _vitalityHudRect = vitalityHud.GetComponent<RectTransform>();
             _vitalityFillImage = vitalityHud.Find("Track/Fill")?.GetComponent<UIImage>();
+            _vitalitySlider = vitalityHud.Find("Track")?.GetComponent<Slider>();
+            _vitalitySliderHandleImage =
+                vitalityHud.Find("Track/Handle")?.GetComponent<UIImage>();
             _vitalityValueText = vitalityHud.Find("Value")?.GetComponent<Text>();
             _experienceModeText = vitalityHud.Find("Mode")?.GetComponent<Text>();
             _demoResetButton = vitalityHud.Find("ResetDemo")?.GetComponent<Button>();
         }
 
         var demoMode = _experienceProfile != null && _experienceProfile.IsPortfolioDemo;
+        EnsureVitalitySlider(vitalityHud, demoMode);
         if (_experienceModeText != null)
         {
             _experienceModeText.gameObject.SetActive(demoMode);
-            _experienceModeText.text = demoMode ? "\u6f14\u793a\u6a21\u5f0f" : string.Empty;
+            _experienceModeText.text = demoMode ? "\u6f14\u793a \u00b7 \u53ef\u62d6\u52a8" : string.Empty;
         }
 
         if (_demoResetButton != null)
@@ -866,6 +933,64 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         }
 
         UpdateVitalityHudSafeArea();
+    }
+
+    private void EnsureVitalitySlider(Transform vitalityHud, bool demoMode)
+    {
+        var track = vitalityHud != null ? vitalityHud.Find("Track") : null;
+        var fillRect = vitalityHud != null
+            ? vitalityHud.Find("Track/Fill") as RectTransform
+            : null;
+        if (track == null || fillRect == null)
+        {
+            return;
+        }
+
+        var trackImage = track.GetComponent<UIImage>();
+        var handle = track.Find("Handle") as RectTransform;
+        if (handle == null)
+        {
+            var handleObject = CreateUiObject("Handle", track);
+            handle = handleObject.GetComponent<RectTransform>();
+            handle.sizeDelta = new Vector2(28f, 40f);
+            _vitalitySliderHandleImage = handleObject.AddComponent<UIImage>();
+            _vitalitySliderHandleImage.color = new Color(0.96f, 0.95f, 0.84f, 1f);
+        }
+        else
+        {
+            _vitalitySliderHandleImage = handle.GetComponent<UIImage>();
+        }
+
+        _vitalitySlider = track.GetComponent<Slider>();
+        if (_vitalitySlider == null)
+        {
+            _vitalitySlider = track.gameObject.AddComponent<Slider>();
+        }
+
+        _vitalitySlider.minValue = 0f;
+        _vitalitySlider.maxValue = 1f;
+        _vitalitySlider.wholeNumbers = false;
+        _vitalitySlider.direction = Slider.Direction.LeftToRight;
+        _vitalitySlider.fillRect = fillRect;
+        _vitalitySlider.handleRect = handle;
+        _vitalitySlider.targetGraphic = _vitalitySliderHandleImage;
+        _vitalitySlider.interactable = demoMode;
+        _vitalitySlider.onValueChanged.RemoveAllListeners();
+        if (demoMode)
+        {
+            _vitalitySlider.onValueChanged.AddListener(SetDemoVitality);
+        }
+
+        if (trackImage != null)
+        {
+            trackImage.raycastTarget = demoMode;
+        }
+
+        if (_vitalitySliderHandleImage != null)
+        {
+            _vitalitySliderHandleImage.raycastTarget = demoMode;
+            _vitalitySliderHandleImage.gameObject.SetActive(demoMode);
+        }
     }
 
     private void UpdateVitalityHudSafeArea()
@@ -888,10 +1013,19 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     private void UpdateVitalityUi(float vitality)
     {
         var normalizedVitality = Mathf.Clamp01(vitality);
+        if (_vitalitySlider != null)
+        {
+            _vitalitySlider.SetValueWithoutNotify(normalizedVitality);
+        }
+
         if (_vitalityFillImage != null)
         {
-            var fillRect = _vitalityFillImage.rectTransform;
-            fillRect.anchorMax = new Vector2(normalizedVitality, 1f);
+            if (_vitalitySlider == null)
+            {
+                var fillRect = _vitalityFillImage.rectTransform;
+                fillRect.anchorMax = new Vector2(normalizedVitality, 1f);
+            }
+
             _vitalityFillImage.color = GetVitalityColor(normalizedVitality);
         }
 
@@ -998,6 +1132,9 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
                 _droopController,
                 _wiltRigV3Controller,
                 _requestedDroopLevel,
+                ShouldShowDroopTestControls
+                    ? _requestedDroopLevel
+                    : CalculateCurrentAppearanceDecay(),
                 _wiltTint,
                 _wiltTintStrength))
         {

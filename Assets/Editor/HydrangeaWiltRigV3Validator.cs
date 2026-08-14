@@ -336,6 +336,7 @@ public static class HydrangeaWiltRigV3Validator
                 null,
                 controller,
                 0f,
+                0f,
                 new Color(0.95f, 0.78f, 0.32f, 1f),
                 0.35f),
             "HydrangeaView failed to bind the validated v3 renderer.");
@@ -357,18 +358,34 @@ public static class HydrangeaWiltRigV3Validator
         }
 
         var propertyBlock = new MaterialPropertyBlock();
-        view.SetWiltImmediate(0f);
+        view.SetAppearanceDecayImmediate(0f);
         renderer.GetPropertyBlock(propertyBlock, 0);
         var healthyColor = propertyBlock.GetColor("_BaseColor");
-        view.SetWiltImmediate(1f);
+        view.SetAppearanceDecayImmediate(PlantGrowthController.AppearanceDecayAtCriticalThreshold);
+        propertyBlock.Clear();
+        renderer.GetPropertyBlock(propertyBlock, 0);
+        var maximumWiltColor = propertyBlock.GetColor("_BaseColor");
+        view.SetAppearanceDecayImmediate(1f);
         propertyBlock.Clear();
         renderer.GetPropertyBlock(propertyBlock, 0);
         var wiltedColor = propertyBlock.GetColor("_BaseColor");
         Require(
             wiltedColor.b < healthyColor.b,
             "HydrangeaView did not apply the expected warm wilt tint.");
+        Require(
+            wiltedColor.b < maximumWiltColor.b,
+            "HydrangeaView did not intensify yellowing below 35% vitality.");
+        Require(
+            wiltedColor.grayscale < maximumWiltColor.grayscale,
+            "HydrangeaView did not reduce brightness below 35% vitality.");
 
-        view.SetWiltImmediate(0f);
+        propertyBlock.Clear();
+        renderer.GetPropertyBlock(propertyBlock, 2);
+        Require(
+            Mathf.Abs(propertyBlock.GetFloat("_WiltBrightness") - 0.58f) < 0.0001f,
+            "HydrangeaView did not apply the expected zero-vitality petal brightness.");
+
+        view.SetAppearanceDecayImmediate(0f);
         propertyBlock.Clear();
         renderer.GetPropertyBlock(propertyBlock, 0);
         var restoredColor = propertyBlock.GetColor("_BaseColor");
