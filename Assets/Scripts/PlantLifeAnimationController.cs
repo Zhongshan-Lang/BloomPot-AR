@@ -2,13 +2,13 @@ using UnityEngine;
 
 public sealed class PlantLifeAnimationController
 {
-    public const float MinimumVitalityMotion = 0.4f;
+    public const float MinimumVitalityMotion = 0.2f;
     public const float MinimumCycleDuration = 4.2f;
     public const float MaximumCycleDuration = 6.2f;
-    public const float MaximumScaleAmplitude = 0.006f;
-    public const float MaximumPitchAmplitude = 0.7f;
-    public const float MaximumYawAmplitude = 0.3f;
-    public const float MaximumRollAmplitude = 1f;
+    public const float MaximumScaleAmplitude = 0.008f;
+    public const float MaximumPitchAmplitude = 1f;
+    public const float MaximumYawAmplitude = 0.55f;
+    public const float MaximumRollAmplitude = 1.8f;
 
     private const float ActivationSmoothing = 2.8f;
     private float _elapsed;
@@ -52,7 +52,8 @@ public sealed class PlantLifeAnimationController
                 pitch * MaximumPitchAmplitude * strength,
                 yaw * MaximumYawAmplitude * strength,
                 roll * MaximumRollAmplitude * strength),
-            _activation);
+            _activation,
+            strength);
     }
 
     public void Reset()
@@ -64,14 +65,20 @@ public sealed class PlantLifeAnimationController
 
 public readonly struct PlantLifeAnimationFrame
 {
-    public PlantLifeAnimationFrame(float scale, Vector3 rotationEuler, float activation)
+    public PlantLifeAnimationFrame(
+        float scale,
+        Vector3 rotationEuler,
+        float activation,
+        float motionStrength)
     {
         Scale = scale;
         RotationEuler = rotationEuler;
         Activation = activation;
+        MotionStrength = motionStrength;
     }
 
     public float Scale { get; }
     public Vector3 RotationEuler { get; }
     public float Activation { get; }
+    public float MotionStrength { get; }
 }

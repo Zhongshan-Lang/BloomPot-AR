@@ -12,8 +12,21 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     private const float ModelLoadRetryDelay = 2f;
     private const float VisitRecognitionDuration = 3f;
     private const float DemoAutosaveInterval = 2f;
+    private const float CompanionStateEvaluationInterval = 1f;
+    private const float CompanionGrowthTransitionDuration = 8f;
+    private const float DemoGrowthTransitionDuration = 20f;
+    private const float LightSamplingDuration = 3f;
     private const string SceneModelName = "Hydrangea_Growth_BlendShape_Unity";
     private static readonly Vector3 BlenderAxisFixEuler = new Vector3(-90f, 0f, 0f);
+    private static readonly string[] GrowthStageNames =
+    {
+        "Seed",
+        "Sprout",
+        "Leafing",
+        "Bud",
+        "HalfBloom",
+        "Bloom"
+    };
 
     [Header("Placement")]
     [SerializeField] private Vector3 _modelLocalPosition = Vector3.zero;
@@ -44,15 +57,34 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     private PlantExperienceProfile _experienceProfile;
     private PlantState _plantState;
     private PlantGrowthController _plantGrowthController;
+    private PlantHydrationController _plantHydrationController;
     private PlantInteractionController _plantInteractionController;
+    private PlantStageProgressionController _stageProgressionController;
+    private PlantWateringController _wateringController;
+    private PlantLightController _plantLightController;
+    private World _illuminationWorld;
     private Text _statusText;
     private UIImage _vitalityFillImage;
     private Slider _vitalitySlider;
     private UIImage _vitalitySliderHandleImage;
     private Text _vitalityValueText;
+    private UIImage _hydrationFillImage;
+    private Text _hydrationValueText;
+    private UIImage _bondFillImage;
+    private Text _bondValueText;
+    private UIImage _growthFillImage;
+    private Text _growthValueText;
+    private UIImage _lightFillImage;
+    private Text _lightValueText;
     private RectTransform _vitalityHudRect;
+    private RectTransform _careHudRect;
     private Text _experienceModeText;
     private Button _demoResetButton;
+    private Text _growthProgressText;
+    private Button _wateringButton;
+    private Text _wateringButtonText;
+    private Button _lightButton;
+    private Text _lightButtonText;
     private readonly List<Button> _stageButtons = new List<Button>();
     private readonly List<Button> _droopButtons = new List<Button>();
 
@@ -69,7 +101,16 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     private float _lastUiVitality = -1f;
     private float _trackedVisitDuration;
     private bool _visitRegisteredForCurrentTrackingSession;
+    private bool _demoSessionStartedFromSeed;
+    private float _automaticGrowthTarget = -1f;
     private float _nextDemoAutosaveTime;
+    private float _nextCompanionStateEvaluationTime;
+    private bool _lightSamplingActive;
+    private float _lightSamplingStartTime;
+    private float _lightSampleSum;
+    private int _lightSampleCount;
+    private string _lightDetectionMessage;
+    private float _lightDetectionMessageUntil;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
     private static void EnsurePortraitOrientation()
@@ -90,6 +131,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     private void Start()
     {
         InitializePersistentState();
+        TrySubscribeToIllumination();
         EnsureEventSystem();
         EnsureUi();
         RefreshUiState(IsTracked());
@@ -98,7 +140,9 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     private void Update()
     {
         var tracked = IsTracked();
+        StartDemoSessionFromSeedOnFirstRecognition(tracked);
         EnsureModelReady(tracked);
+        UpdateLightExposure(tracked);
         UpdateRealtimeGrowth();
         UpdateCompanionInteraction(tracked);
         UpdateVitalityHudSafeArea();
@@ -111,6 +155,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             tracked && modelReady && !ShouldShowDroopTestControls,
             vitality,
             appearanceDecay);
+        SyncDisplayedGrowthProgress();
         RefreshUiState(tracked);
         UpdatePlacementAnimation(tracked);
     }
@@ -166,6 +211,11 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         SavePersistentState();
     }
 
+    private void OnDestroy()
+    {
+        UnsubscribeFromIllumination();
+    }
+
     private void InitializePersistentState()
     {
         try
@@ -178,12 +228,20 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
                 _experienceProfile);
             _plantState = _plantSaveService.LoadOrCreate();
             _plantGrowthController = new PlantGrowthController(_experienceProfile);
+            _plantHydrationController = new PlantHydrationController(_experienceProfile);
             _plantInteractionController = new PlantInteractionController(_experienceProfile);
+            _stageProgressionController = new PlantStageProgressionController(_experienceProfile);
+            _wateringController = new PlantWateringController(_experienceProfile);
+            _plantLightController = new PlantLightController(_experienceProfile);
             var now = System.DateTime.UtcNow;
             var progress = _plantGrowthController.ApplyOfflineProgress(_plantState, now);
+            var hydrationProgress = _plantHydrationController.ApplyTimeProgress(_plantState, now);
             _plantGrowthController.ResetRealtime(now);
+            _nextCompanionStateEvaluationTime =
+                Time.unscaledTime + CompanionStateEvaluationInterval;
             _requestedDroopLevel = ShouldShowDroopTestControls ? 0f : progress.WiltAmount;
-            if (progress.VitalityChanged)
+            var growthChanged = EvaluateGrowthProgress(now);
+            if (progress.VitalityChanged || hydrationProgress.HydrationChanged || growthChanged)
             {
                 SavePersistentState();
             }
@@ -194,7 +252,14 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             _experienceProfile = _experienceProfile ?? PlantExperienceProfile.Companion;
             _plantState = PlantState.CreateDefault(System.DateTime.UtcNow, _experienceProfile);
             _plantGrowthController = new PlantGrowthController(_experienceProfile);
+            _plantHydrationController = new PlantHydrationController(_experienceProfile);
             _plantInteractionController = new PlantInteractionController(_experienceProfile);
+            _stageProgressionController = new PlantStageProgressionController(_experienceProfile);
+            _wateringController = new PlantWateringController(_experienceProfile);
+            _plantLightController = new PlantLightController(_experienceProfile);
+            _plantGrowthController.ResetRealtime(System.DateTime.UtcNow);
+            _nextCompanionStateEvaluationTime =
+                Time.unscaledTime + CompanionStateEvaluationInterval;
             _requestedDroopLevel = 0f;
         }
     }
@@ -202,28 +267,186 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     private void UpdateRealtimeGrowth()
     {
         if (_experienceProfile == null
-            || !_experienceProfile.UsesRealtimeDecay
             || _plantGrowthController == null
+            || _plantHydrationController == null
             || _plantState == null
             || ShouldShowDroopTestControls)
         {
             return;
         }
 
-        var progress = _plantGrowthController.ApplyRealtimeProgress(
-            _plantState,
-            System.DateTime.UtcNow);
-        if (!progress.VitalityChanged)
+        if (!_experienceProfile.IsPortfolioDemo
+            && Time.unscaledTime < _nextCompanionStateEvaluationTime)
         {
             return;
         }
 
-        ApplyCompanionStateToView();
+        if (!_experienceProfile.IsPortfolioDemo)
+        {
+            _nextCompanionStateEvaluationTime =
+                Time.unscaledTime + CompanionStateEvaluationInterval;
+        }
+
+        var now = System.DateTime.UtcNow;
+        var progress = _plantGrowthController.ApplyRealtimeProgress(_plantState, now);
+        var hydrationProgress = _plantHydrationController.ApplyTimeProgress(_plantState, now);
+        var vitalityChanged = progress.VitalityChanged;
+        var growthChanged = vitalityChanged && EvaluateGrowthProgress(now);
+
+        if (!vitalityChanged && !hydrationProgress.HydrationChanged && !growthChanged)
+        {
+            return;
+        }
+
+        if (vitalityChanged)
+        {
+            ApplyCompanionStateToView();
+        }
+
+        _hasUiStateSnapshot = false;
         if (Time.unscaledTime >= _nextDemoAutosaveTime)
         {
             SavePersistentState();
             _nextDemoAutosaveTime = Time.unscaledTime + DemoAutosaveInterval;
         }
+    }
+
+    private void TrySubscribeToIllumination()
+    {
+        var vuforiaBehaviour = VuforiaBehaviour.Instance;
+        var world = vuforiaBehaviour != null ? vuforiaBehaviour.World : null;
+        if (world == null || ReferenceEquals(world, _illuminationWorld))
+        {
+            return;
+        }
+
+        UnsubscribeFromIllumination();
+        _illuminationWorld = world;
+        _illuminationWorld.OnStateUpdated += OnVuforiaStateUpdated;
+    }
+
+    private void UnsubscribeFromIllumination()
+    {
+        if (_illuminationWorld == null)
+        {
+            return;
+        }
+
+        _illuminationWorld.OnStateUpdated -= OnVuforiaStateUpdated;
+        _illuminationWorld = null;
+    }
+
+    private void OnVuforiaStateUpdated()
+    {
+        if (!_lightSamplingActive || _illuminationWorld == null)
+        {
+            return;
+        }
+
+        var illumination = _illuminationWorld.IlluminationData;
+        float normalizedLight;
+        if (illumination.AmbientIntensity.HasValue
+            && illumination.AmbientIntensity.Value >= 0f)
+        {
+            normalizedLight = PlantLightController.NormalizeAmbientIntensity(
+                illumination.AmbientIntensity.Value);
+        }
+        else if (illumination.IntensityCorrection.HasValue)
+        {
+            normalizedLight = PlantLightController.NormalizeIntensityCorrection(
+                illumination.IntensityCorrection.Value);
+        }
+        else
+        {
+            return;
+        }
+
+        _lightSampleSum += normalizedLight;
+        _lightSampleCount++;
+    }
+
+    private void UpdateLightExposure(bool tracked)
+    {
+        if (_plantLightController == null
+            || _plantState == null
+            || ShouldShowDroopTestControls)
+        {
+            return;
+        }
+
+        TrySubscribeToIllumination();
+        var now = System.DateTime.UtcNow;
+        if (_plantLightController.RefreshDay(_plantState, now))
+        {
+            ResetLightSampling();
+            _hasUiStateSnapshot = false;
+            SavePersistentState();
+        }
+
+        if (_plantState.lightEnvironmentSampled)
+        {
+            ResetLightSampling();
+            return;
+        }
+
+        if (!tracked)
+        {
+            ResetLightSampling();
+            return;
+        }
+
+        if (!_lightSamplingActive)
+        {
+            _lightSamplingActive = true;
+            _lightSamplingStartTime = Time.unscaledTime;
+            _lightSampleSum = 0f;
+            _lightSampleCount = 0;
+            _hasUiStateSnapshot = false;
+            return;
+        }
+
+        if (Time.unscaledTime - _lightSamplingStartTime < LightSamplingDuration)
+        {
+            return;
+        }
+
+        var usedMeasuredLight = _lightSampleCount > 0;
+        var initialLight = usedMeasuredLight
+            ? _lightSampleSum / _lightSampleCount
+            : PlantLightController.NeutralLight;
+        var result = _plantLightController.CaptureEnvironmentLight(
+            _plantState,
+            initialLight,
+            now);
+        ResetLightSampling();
+        if (!result.Captured)
+        {
+            return;
+        }
+
+        var lightPercent = Mathf.RoundToInt(result.CurrentLight * 100f);
+        _lightDetectionMessage = usedMeasuredLight
+            ? $"\u5149\u7167\u68c0\u6d4b\u6210\u529f\uff1a{lightPercent}%  \u00b7  " +
+              GetLightEffectLabel(result.CurrentLight)
+            : "\u672a\u83b7\u53d6\u771f\u5b9e\u5149\u7167\uff0c\u5df2\u4f7f\u7528\u4e2d\u6027\u503c 70%";
+        _lightDetectionMessageUntil = Time.unscaledTime + 4f;
+
+        var growthChanged = EvaluateGrowthProgress(now);
+        if (growthChanged)
+        {
+            ApplyCompanionStateToView();
+        }
+
+        _hasUiStateSnapshot = false;
+        SavePersistentState();
+    }
+
+    private void ResetLightSampling()
+    {
+        _lightSamplingActive = false;
+        _lightSamplingStartTime = 0f;
+        _lightSampleSum = 0f;
+        _lightSampleCount = 0;
     }
 
     private void SavePersistentState()
@@ -232,6 +455,8 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         {
             return;
         }
+
+        SyncDisplayedGrowthProgress();
 
         if (!_plantSaveService.TrySave(_plantState, out var error))
         {
@@ -251,8 +476,28 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         _plantGrowthController.ResetRealtime(now);
         _trackedVisitDuration = 0f;
         _visitRegisteredForCurrentTrackingSession = false;
+        _automaticGrowthTarget = -1f;
+        ResetLightSampling();
+        _lightDetectionMessage = string.Empty;
+        _lightDetectionMessageUntil = 0f;
+        _view?.SetGrowthProgressImmediate(_plantState.growthProgress);
         ApplyCompanionStateToView();
         SavePersistentState();
+    }
+
+    private void StartDemoSessionFromSeedOnFirstRecognition(bool tracked)
+    {
+        if (!tracked
+            || _demoSessionStartedFromSeed
+            || ShouldShowDroopTestControls
+            || _experienceProfile == null
+            || !_experienceProfile.IsPortfolioDemo)
+        {
+            return;
+        }
+
+        _demoSessionStartedFromSeed = true;
+        ResetDemoState();
     }
 
     private void SetDemoVitality(float vitality)
@@ -269,8 +514,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         _plantState.vitality = Mathf.Clamp01(vitality);
         _plantState.lastInteractionUtc = PlantState.FormatUtc(now);
         _plantGrowthController.ResetRealtime(now);
-        _trackedVisitDuration = 0f;
-        _visitRegisteredForCurrentTrackingSession = IsTracked();
+        var growthChanged = EvaluateGrowthProgress(now);
 
         var wiltTarget = _plantGrowthController.CalculateWilt(_plantState.vitality);
         if (!Mathf.Approximately(_requestedDroopLevel, wiltTarget))
@@ -281,6 +525,10 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
 
         _hasUiStateSnapshot = false;
         RefreshUiState(IsTracked());
+        if (growthChanged)
+        {
+            SavePersistentState();
+        }
     }
 
     private void EnsureModelInstance()
@@ -388,6 +636,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         rowElement.preferredHeight = 56f;
 
         _stageButtons.Clear();
+        _stageButtons.Add(CreateStageButton(row.transform, font, "\u79cd\u5b50", "Seed"));
         _stageButtons.Add(CreateStageButton(row.transform, font, "\u5e7c\u82d7", "Sprout"));
         _stageButtons.Add(CreateStageButton(row.transform, font, "\u5c55\u53f6", "Leafing"));
         _stageButtons.Add(CreateStageButton(row.transform, font, "\u82b1\u82de", "Bud"));
@@ -395,6 +644,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         _stageButtons.Add(CreateStageButton(row.transform, font, "\u76db\u5f00", "Bloom"));
 
         EnsureVitalityUi(canvasObject.transform, font);
+        EnsureCareUi(canvasObject.transform, font);
 
         if (ShouldShowDroopTestControls)
         {
@@ -406,9 +656,20 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
 
     private void RefreshUiState(bool tracked)
     {
+        var lightDetectionMessageActive = !string.IsNullOrEmpty(_lightDetectionMessage)
+            && Time.unscaledTime < _lightDetectionMessageUntil;
+        if (!lightDetectionMessageActive && _lightDetectionMessageUntil > 0f)
+        {
+            _lightDetectionMessage = string.Empty;
+            _lightDetectionMessageUntil = 0f;
+            _hasUiStateSnapshot = false;
+        }
+
         var modelReady = _view != null && _view.IsReady;
         var currentStageName = _view != null ? _view.CurrentStageName : null;
         var vitality = _plantState != null ? Mathf.Clamp01(_plantState.vitality) : 1f;
+        UpdateCareUi(tracked, modelReady);
+        UpdatePlantMetricUi();
         if (_hasUiStateSnapshot
             && tracked == _lastUiTracked
             && modelReady == _lastUiModelReady
@@ -426,8 +687,6 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         _lastUiDroopLevel = _requestedDroopLevel;
         _lastUiVitality = vitality;
 
-        UpdateVitalityUi(vitality);
-
         if (_statusText != null)
         {
             if (!tracked)
@@ -437,6 +696,14 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             else if (!modelReady)
             {
                 _statusText.text = "\u5df2\u8bc6\u522b\u56fe\u50cf\uff0c\u6b63\u5728\u51c6\u5907\u4ea4\u4e92\u7ee3\u7403\u82b1\u6a21\u578b";
+            }
+            else if (lightDetectionMessageActive)
+            {
+                _statusText.text = _lightDetectionMessage;
+            }
+            else if (_plantState != null && !_plantState.lightEnvironmentSampled)
+            {
+                _statusText.text = "\u5df2\u8bc6\u522b\u56fe\u50cf\uff0c\u6b63\u5728\u68c0\u6d4b\u5f53\u524d\u73af\u5883\u5149\u7167";
             }
             else
             {
@@ -451,10 +718,27 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         {
             if (button != null)
             {
+                var hasStage = _buttonStages.TryGetValue(button, out var stageName);
+                var stageIndex = hasStage ? GetStageIndex(stageName) : -1;
+                var freeStageSelection = _experienceProfile == null
+                    || _experienceProfile.IsPortfolioDemo
+                    || ShouldShowDroopTestControls;
                 button.interactable = tracked
-                    && _buttonStages.TryGetValue(button, out var stageName)
+                    && hasStage
                     && _view != null
-                    && _view.CanPresentStage(stageName);
+                    && _view.CanPresentStage(stageName)
+                    && (freeStageSelection
+                        || (_plantState != null && stageIndex == _plantState.stageIndex));
+
+                if (button.targetGraphic is UIImage image)
+                {
+                    var isCurrentStage = freeStageSelection
+                        ? string.Equals(stageName, currentStageName, System.StringComparison.Ordinal)
+                        : _plantState != null && stageIndex == _plantState.stageIndex;
+                    image.color = isCurrentStage
+                        ? new Color(0.77f, 0.52f, 0.2f, 0.98f)
+                        : new Color(0.23f, 0.45f, 0.35f, 0.95f);
+                }
             }
         }
 
@@ -523,8 +807,10 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
 
     private void RegisterVisit()
     {
-        var result = _plantInteractionController.RegisterVisit(_plantState, System.DateTime.UtcNow);
-        if (result.StateChanged)
+        var now = System.DateTime.UtcNow;
+        var result = _plantInteractionController.RegisterVisit(_plantState, now);
+        var growthChanged = EvaluateGrowthProgress(now);
+        if (result.StateChanged || growthChanged)
         {
             ApplyCompanionStateToView();
             SavePersistentState();
@@ -533,12 +819,106 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
 
     private void RegisterCompanionTap()
     {
-        var result = _plantInteractionController.RegisterTap(_plantState, System.DateTime.UtcNow);
+        var now = System.DateTime.UtcNow;
+        var result = _plantInteractionController.RegisterTap(_plantState, now);
         _view?.PlayInteractionResponse(result.Rewarded ? 1f : 0.55f);
-        if (result.StateChanged)
+        var growthChanged = EvaluateGrowthProgress(now);
+        if (result.StateChanged || growthChanged)
         {
             ApplyCompanionStateToView();
             SavePersistentState();
+        }
+    }
+
+    private void RegisterWatering()
+    {
+        if (_wateringController == null || _plantState == null)
+        {
+            return;
+        }
+
+        var now = System.DateTime.UtcNow;
+        var result = _wateringController.RegisterWatering(_plantState, now);
+        _view?.PlayInteractionResponse(result.Rewarded ? 0.85f : 0.35f);
+        var growthChanged = EvaluateGrowthProgress(now);
+        if (result.StateChanged || growthChanged)
+        {
+            ApplyCompanionStateToView();
+            SavePersistentState();
+        }
+
+        _hasUiStateSnapshot = false;
+        RefreshUiState(IsTracked());
+    }
+
+    private void RegisterLightBoost()
+    {
+        if (_plantLightController == null || _plantState == null)
+        {
+            return;
+        }
+
+        var now = System.DateTime.UtcNow;
+        var result = _plantLightController.AddLightBoost(_plantState, now);
+        _view?.PlayInteractionResponse(result.Added ? 0.7f : 0.25f);
+        if (result.Added)
+        {
+            EvaluateGrowthProgress(now);
+            SavePersistentState();
+        }
+
+        _hasUiStateSnapshot = false;
+        RefreshUiState(IsTracked());
+    }
+
+    private bool EvaluateGrowthProgress(System.DateTime utcNow)
+    {
+        if (_experienceProfile == null
+            || ShouldShowDroopTestControls
+            || _stageProgressionController == null
+            || _plantState == null)
+        {
+            return false;
+        }
+
+        var result = _stageProgressionController.EvaluateProgress(_plantState, utcNow);
+        if (!result.ProgressChanged)
+        {
+            return false;
+        }
+
+        StartAutomaticGrowthTransition(result.CurrentProgress);
+
+        _hasUiStateSnapshot = false;
+        return true;
+    }
+
+    private void StartAutomaticGrowthTransition(float targetProgress)
+    {
+        _automaticGrowthTarget = Mathf.Clamp01(targetProgress);
+        var transitionDuration = _experienceProfile != null && _experienceProfile.IsPortfolioDemo
+            ? DemoGrowthTransitionDuration
+            : CompanionGrowthTransitionDuration;
+        _view?.SetGrowthProgressTarget(_automaticGrowthTarget, transitionDuration);
+    }
+
+    private void SyncDisplayedGrowthProgress()
+    {
+        if (_automaticGrowthTarget < 0f || _plantState == null || _view == null || !_view.IsReady)
+        {
+            return;
+        }
+
+        var displayedProgress = Mathf.Min(
+            _plantState.growthProgress,
+            _view.CurrentGrowthProgress);
+        _plantState.displayedGrowthProgress = Mathf.Max(
+            _plantState.displayedGrowthProgress,
+            displayedProgress);
+        if (Mathf.Abs(_view.CurrentGrowthProgress - _automaticGrowthTarget) < 0.0001f)
+        {
+            _plantState.displayedGrowthProgress = _automaticGrowthTarget;
+            _automaticGrowthTarget = -1f;
         }
     }
 
@@ -623,7 +1003,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     {
         var buttonObject = CreateUiObject(label + "Button", parent);
         var buttonRect = buttonObject.GetComponent<RectTransform>();
-        buttonRect.sizeDelta = new Vector2(108f, 52f);
+        buttonRect.sizeDelta = new Vector2(90f, 52f);
 
         var image = buttonObject.AddComponent<UIImage>();
         image.color = new Color(0.23f, 0.45f, 0.35f, 0.95f);
@@ -744,6 +1124,14 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
 
     private void SetStage(string blendShapeName)
     {
+        if (_experienceProfile != null
+            && !_experienceProfile.IsPortfolioDemo
+            && !ShouldShowDroopTestControls)
+        {
+            return;
+        }
+
+        _automaticGrowthTarget = -1f;
         _view?.SetStage(blendShapeName);
     }
 
@@ -775,7 +1163,13 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
 
         var vitalityHud = canvas.Find("VitalityHud");
         if (vitalityHud != null
-            && (vitalityHud.Find("Mode") == null || vitalityHud.Find("ResetDemo") == null))
+            && (vitalityHud.Find("Mode") == null
+                || vitalityHud.Find("ResetDemo") == null
+                || vitalityHud.Find("VitalityTrack") == null
+                || vitalityHud.Find("HydrationTrack") == null
+                || vitalityHud.Find("BondTrack") == null
+                || vitalityHud.Find("GrowthTrack") == null
+                || vitalityHud.Find("LightTrack") == null))
         {
             vitalityHud.gameObject.SetActive(false);
             Destroy(vitalityHud.gameObject);
@@ -791,7 +1185,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             vitalityRect.anchorMax = Vector2.one;
             vitalityRect.pivot = Vector2.one;
             vitalityRect.anchoredPosition = new Vector2(-32f, -54f);
-            vitalityRect.sizeDelta = new Vector2(330f, 86f);
+            vitalityRect.sizeDelta = new Vector2(400f, 278f);
             _vitalityHudRect = vitalityRect;
 
             var card = vitalityObject.AddComponent<UIImage>();
@@ -800,8 +1194,8 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
 
             var titleObject = CreateUiObject("Title", vitalityHud);
             var titleRect = titleObject.GetComponent<RectTransform>();
-            titleRect.anchorMin = new Vector2(0f, 0.48f);
-            titleRect.anchorMax = new Vector2(0.22f, 1f);
+            titleRect.anchorMin = new Vector2(0f, 0.83f);
+            titleRect.anchorMax = new Vector2(0.3f, 1f);
             titleRect.offsetMin = new Vector2(16f, 0f);
             titleRect.offsetMax = Vector2.zero;
             var title = titleObject.AddComponent<Text>();
@@ -809,13 +1203,13 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             title.fontSize = 20;
             title.alignment = TextAnchor.MiddleLeft;
             title.color = new Color(0.9f, 0.94f, 0.87f, 1f);
-            title.text = "\u6d3b\u529b";
+            title.text = "\u690d\u7269\u72b6\u6001";
             title.raycastTarget = false;
 
             var modeObject = CreateUiObject("Mode", vitalityHud);
             var modeRect = modeObject.GetComponent<RectTransform>();
-            modeRect.anchorMin = new Vector2(0.22f, 0.48f);
-            modeRect.anchorMax = new Vector2(0.5f, 1f);
+            modeRect.anchorMin = new Vector2(0.3f, 0.83f);
+            modeRect.anchorMax = new Vector2(0.72f, 1f);
             modeRect.offsetMin = Vector2.zero;
             modeRect.offsetMax = Vector2.zero;
             _experienceModeText = modeObject.AddComponent<Text>();
@@ -825,32 +1219,25 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             _experienceModeText.color = new Color(0.96f, 0.7f, 0.24f, 1f);
             _experienceModeText.raycastTarget = false;
 
-            var backgroundObject = CreateUiObject("Track", vitalityHud);
-            var backgroundRect = backgroundObject.GetComponent<RectTransform>();
-            backgroundRect.anchorMin = new Vector2(0f, 0f);
-            backgroundRect.anchorMax = new Vector2(1f, 0.38f);
-            backgroundRect.offsetMin = new Vector2(16f, 14f);
-            backgroundRect.offsetMax = new Vector2(-16f, 0f);
-            var background = backgroundObject.AddComponent<UIImage>();
-            background.color = new Color(0.02f, 0.04f, 0.03f, 0.7f);
-            background.raycastTarget = false;
+            CreateMetricRow(vitalityHud, font, "Vitality", "\u6d3b\u529b", 0.67f, 0.82f,
+                out var vitalityTrack, out _vitalityFillImage, out _vitalityValueText);
+            CreateMetricRow(vitalityHud, font, "Hydration", "\u6c34\u5206", 0.52f, 0.67f,
+                out _, out _hydrationFillImage, out _hydrationValueText);
+            CreateMetricRow(vitalityHud, font, "Bond", "\u4eb2\u5bc6", 0.37f, 0.52f,
+                out _, out _bondFillImage, out _bondValueText);
+            CreateMetricRow(vitalityHud, font, "Growth", "\u6210\u957f", 0.22f, 0.37f,
+                out _, out _growthFillImage, out _growthValueText);
+            CreateMetricRow(vitalityHud, font, "Light", "\u5149\u7167", 0.07f, 0.22f,
+                out _, out _lightFillImage, out _lightValueText);
 
-            var fillObject = CreateUiObject("Fill", backgroundObject.transform);
-            var fillRect = fillObject.GetComponent<RectTransform>();
-            fillRect.anchorMin = Vector2.zero;
-            fillRect.anchorMax = Vector2.one;
-            fillRect.offsetMin = new Vector2(3f, 3f);
-            fillRect.offsetMax = new Vector2(-3f, -3f);
-            _vitalityFillImage = fillObject.AddComponent<UIImage>();
-            _vitalityFillImage.raycastTarget = false;
-
-            var handleObject = CreateUiObject("Handle", backgroundObject.transform);
+            var fillRect = _vitalityFillImage.rectTransform;
+            var handleObject = CreateUiObject("Handle", vitalityTrack.transform);
             var handleRect = handleObject.GetComponent<RectTransform>();
-            handleRect.sizeDelta = new Vector2(28f, 40f);
+            handleRect.sizeDelta = new Vector2(24f, 32f);
             _vitalitySliderHandleImage = handleObject.AddComponent<UIImage>();
             _vitalitySliderHandleImage.color = new Color(0.96f, 0.95f, 0.84f, 1f);
 
-            _vitalitySlider = backgroundObject.AddComponent<Slider>();
+            _vitalitySlider = vitalityTrack.gameObject.AddComponent<Slider>();
             _vitalitySlider.minValue = 0f;
             _vitalitySlider.maxValue = 1f;
             _vitalitySlider.direction = Slider.Direction.LeftToRight;
@@ -858,24 +1245,10 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             _vitalitySlider.handleRect = handleRect;
             _vitalitySlider.targetGraphic = _vitalitySliderHandleImage;
 
-            var valueObject = CreateUiObject("Value", vitalityHud);
-            var valueRect = valueObject.GetComponent<RectTransform>();
-            valueRect.anchorMin = new Vector2(0.5f, 0.48f);
-            valueRect.anchorMax = new Vector2(0.7f, 1f);
-            valueRect.offsetMin = Vector2.zero;
-            valueRect.offsetMax = Vector2.zero;
-            _vitalityValueText = valueObject.AddComponent<Text>();
-            _vitalityValueText.font = font;
-            _vitalityValueText.fontSize = 20;
-            _vitalityValueText.fontStyle = FontStyle.Bold;
-            _vitalityValueText.alignment = TextAnchor.MiddleRight;
-            _vitalityValueText.color = Color.white;
-            _vitalityValueText.raycastTarget = false;
-
             var resetObject = CreateUiObject("ResetDemo", vitalityHud);
             var resetRect = resetObject.GetComponent<RectTransform>();
-            resetRect.anchorMin = new Vector2(0.72f, 0.5f);
-            resetRect.anchorMax = new Vector2(0.98f, 0.98f);
+            resetRect.anchorMin = new Vector2(0.74f, 0.82f);
+            resetRect.anchorMax = new Vector2(0.97f, 0.97f);
             resetRect.offsetMin = Vector2.zero;
             resetRect.offsetMax = Vector2.zero;
             var resetImage = resetObject.AddComponent<UIImage>();
@@ -900,11 +1273,19 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         {
             vitalityHud.gameObject.SetActive(true);
             _vitalityHudRect = vitalityHud.GetComponent<RectTransform>();
-            _vitalityFillImage = vitalityHud.Find("Track/Fill")?.GetComponent<UIImage>();
-            _vitalitySlider = vitalityHud.Find("Track")?.GetComponent<Slider>();
+            _vitalityFillImage = vitalityHud.Find("VitalityTrack/Fill")?.GetComponent<UIImage>();
+            _vitalitySlider = vitalityHud.Find("VitalityTrack")?.GetComponent<Slider>();
             _vitalitySliderHandleImage =
-                vitalityHud.Find("Track/Handle")?.GetComponent<UIImage>();
-            _vitalityValueText = vitalityHud.Find("Value")?.GetComponent<Text>();
+                vitalityHud.Find("VitalityTrack/Handle")?.GetComponent<UIImage>();
+            _vitalityValueText = vitalityHud.Find("VitalityValue")?.GetComponent<Text>();
+            _hydrationFillImage = vitalityHud.Find("HydrationTrack/Fill")?.GetComponent<UIImage>();
+            _hydrationValueText = vitalityHud.Find("HydrationValue")?.GetComponent<Text>();
+            _bondFillImage = vitalityHud.Find("BondTrack/Fill")?.GetComponent<UIImage>();
+            _bondValueText = vitalityHud.Find("BondValue")?.GetComponent<Text>();
+            _growthFillImage = vitalityHud.Find("GrowthTrack/Fill")?.GetComponent<UIImage>();
+            _growthValueText = vitalityHud.Find("GrowthValue")?.GetComponent<Text>();
+            _lightFillImage = vitalityHud.Find("LightTrack/Fill")?.GetComponent<UIImage>();
+            _lightValueText = vitalityHud.Find("LightValue")?.GetComponent<Text>();
             _experienceModeText = vitalityHud.Find("Mode")?.GetComponent<Text>();
             _demoResetButton = vitalityHud.Find("ResetDemo")?.GetComponent<Button>();
         }
@@ -924,12 +1305,181 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             _demoResetButton.onClick.AddListener(ResetDemoState);
         }
 
-        if (_vitalityValueText != null)
+        UpdateVitalityHudSafeArea();
+    }
+
+    private static void CreateMetricRow(
+        Transform parent,
+        Font font,
+        string metricName,
+        string labelText,
+        float rowMin,
+        float rowMax,
+        out UIImage track,
+        out UIImage fill,
+        out Text valueText)
+    {
+        var labelObject = CreateUiObject(metricName + "Label", parent);
+        var labelRect = labelObject.GetComponent<RectTransform>();
+        labelRect.anchorMin = new Vector2(0f, rowMin);
+        labelRect.anchorMax = new Vector2(0.22f, rowMax);
+        labelRect.offsetMin = new Vector2(16f, 0f);
+        labelRect.offsetMax = Vector2.zero;
+        var label = labelObject.AddComponent<Text>();
+        label.font = font;
+        label.fontSize = 17;
+        label.alignment = TextAnchor.MiddleLeft;
+        label.color = new Color(0.86f, 0.91f, 0.84f, 1f);
+        label.text = labelText;
+        label.raycastTarget = false;
+
+        var trackObject = CreateUiObject(metricName + "Track", parent);
+        var trackRect = trackObject.GetComponent<RectTransform>();
+        trackRect.anchorMin = new Vector2(0.22f, rowMin + 0.045f);
+        trackRect.anchorMax = new Vector2(0.78f, rowMax - 0.045f);
+        trackRect.offsetMin = Vector2.zero;
+        trackRect.offsetMax = Vector2.zero;
+        track = trackObject.AddComponent<UIImage>();
+        track.color = new Color(0.02f, 0.04f, 0.03f, 0.72f);
+        track.raycastTarget = false;
+
+        var fillObject = CreateUiObject("Fill", trackObject.transform);
+        var fillRect = fillObject.GetComponent<RectTransform>();
+        fillRect.anchorMin = Vector2.zero;
+        fillRect.anchorMax = Vector2.one;
+        fillRect.offsetMin = new Vector2(3f, 3f);
+        fillRect.offsetMax = new Vector2(-3f, -3f);
+        fill = fillObject.AddComponent<UIImage>();
+        fill.raycastTarget = false;
+
+        var valueObject = CreateUiObject(metricName + "Value", parent);
+        var valueRect = valueObject.GetComponent<RectTransform>();
+        valueRect.anchorMin = new Vector2(0.79f, rowMin);
+        valueRect.anchorMax = new Vector2(0.97f, rowMax);
+        valueRect.offsetMin = Vector2.zero;
+        valueRect.offsetMax = Vector2.zero;
+        valueText = valueObject.AddComponent<Text>();
+        valueText.font = font;
+        valueText.fontSize = 17;
+        valueText.fontStyle = FontStyle.Bold;
+        valueText.alignment = TextAnchor.MiddleRight;
+        valueText.color = Color.white;
+        valueText.raycastTarget = false;
+    }
+
+    private void EnsureCareUi(Transform canvas, Font font)
+    {
+        var careHud = canvas.Find("CareHud");
+        if (careHud != null
+            && (careHud.Find("Progress") == null
+                || careHud.Find("Water") == null
+                || careHud.Find("Light") == null))
         {
-            var valueRect = _vitalityValueText.rectTransform;
-            valueRect.anchorMin = new Vector2(demoMode ? 0.5f : 0.55f, 0.48f);
-            valueRect.anchorMax = new Vector2(demoMode ? 0.7f : 1f, 1f);
-            valueRect.offsetMax = new Vector2(demoMode ? 0f : -16f, 0f);
+            careHud.gameObject.SetActive(false);
+            Destroy(careHud.gameObject);
+            careHud = null;
+        }
+
+        if (careHud == null)
+        {
+            var careObject = CreateUiObject("CareHud", canvas);
+            careHud = careObject.transform;
+            _careHudRect = careObject.GetComponent<RectTransform>();
+            _careHudRect.anchorMin = new Vector2(0f, 1f);
+            _careHudRect.anchorMax = new Vector2(0f, 1f);
+            _careHudRect.pivot = new Vector2(0f, 1f);
+            _careHudRect.anchoredPosition = new Vector2(32f, -54f);
+            _careHudRect.sizeDelta = new Vector2(430f, 154f);
+
+            var card = careObject.AddComponent<UIImage>();
+            card.color = new Color(0.07f, 0.12f, 0.1f, 0.86f);
+            card.raycastTarget = false;
+
+            var progressObject = CreateUiObject("Progress", careHud);
+            var progressRect = progressObject.GetComponent<RectTransform>();
+            progressRect.anchorMin = new Vector2(0f, 0.38f);
+            progressRect.anchorMax = Vector2.one;
+            progressRect.offsetMin = new Vector2(18f, 4f);
+            progressRect.offsetMax = new Vector2(-18f, -10f);
+            _growthProgressText = progressObject.AddComponent<Text>();
+            _growthProgressText.font = font;
+            _growthProgressText.fontSize = 17;
+            _growthProgressText.alignment = TextAnchor.MiddleLeft;
+            _growthProgressText.color = new Color(0.92f, 0.96f, 0.88f, 1f);
+            _growthProgressText.raycastTarget = false;
+
+            var waterObject = CreateUiObject("Water", careHud);
+            var waterRect = waterObject.GetComponent<RectTransform>();
+            waterRect.anchorMin = new Vector2(0.04f, 0.08f);
+            waterRect.anchorMax = new Vector2(0.49f, 0.36f);
+            waterRect.offsetMin = Vector2.zero;
+            waterRect.offsetMax = Vector2.zero;
+            var waterImage = waterObject.AddComponent<UIImage>();
+            waterImage.color = new Color(0.16f, 0.49f, 0.62f, 0.98f);
+            _wateringButton = waterObject.AddComponent<Button>();
+            _wateringButton.targetGraphic = waterImage;
+
+            var labelObject = CreateUiObject("Label", waterObject.transform);
+            var labelRect = labelObject.GetComponent<RectTransform>();
+            labelRect.anchorMin = Vector2.zero;
+            labelRect.anchorMax = Vector2.one;
+            labelRect.offsetMin = Vector2.zero;
+            labelRect.offsetMax = Vector2.zero;
+            _wateringButtonText = labelObject.AddComponent<Text>();
+            _wateringButtonText.font = font;
+            _wateringButtonText.fontSize = 15;
+            _wateringButtonText.fontStyle = FontStyle.Bold;
+            _wateringButtonText.alignment = TextAnchor.MiddleCenter;
+            _wateringButtonText.color = Color.white;
+            _wateringButtonText.raycastTarget = false;
+
+            var lightObject = CreateUiObject("Light", careHud);
+            var lightRect = lightObject.GetComponent<RectTransform>();
+            lightRect.anchorMin = new Vector2(0.51f, 0.08f);
+            lightRect.anchorMax = new Vector2(0.96f, 0.36f);
+            lightRect.offsetMin = Vector2.zero;
+            lightRect.offsetMax = Vector2.zero;
+            var lightImage = lightObject.AddComponent<UIImage>();
+            lightImage.color = new Color(0.76f, 0.55f, 0.14f, 0.98f);
+            _lightButton = lightObject.AddComponent<Button>();
+            _lightButton.targetGraphic = lightImage;
+
+            var lightLabelObject = CreateUiObject("Label", lightObject.transform);
+            var lightLabelRect = lightLabelObject.GetComponent<RectTransform>();
+            lightLabelRect.anchorMin = Vector2.zero;
+            lightLabelRect.anchorMax = Vector2.one;
+            lightLabelRect.offsetMin = Vector2.zero;
+            lightLabelRect.offsetMax = Vector2.zero;
+            _lightButtonText = lightLabelObject.AddComponent<Text>();
+            _lightButtonText.font = font;
+            _lightButtonText.fontSize = 15;
+            _lightButtonText.fontStyle = FontStyle.Bold;
+            _lightButtonText.alignment = TextAnchor.MiddleCenter;
+            _lightButtonText.color = Color.white;
+            _lightButtonText.raycastTarget = false;
+        }
+        else
+        {
+            careHud.gameObject.SetActive(true);
+            _careHudRect = careHud.GetComponent<RectTransform>();
+            _growthProgressText = careHud.Find("Progress")?.GetComponent<Text>();
+            _wateringButton = careHud.Find("Water")?.GetComponent<Button>();
+            _wateringButtonText = careHud.Find("Water/Label")?.GetComponent<Text>();
+            _lightButton = careHud.Find("Light")?.GetComponent<Button>();
+            _lightButtonText = careHud.Find("Light/Label")?.GetComponent<Text>();
+        }
+
+        careHud.gameObject.SetActive(!ShouldShowDroopTestControls);
+        if (_wateringButton != null)
+        {
+            _wateringButton.onClick.RemoveAllListeners();
+            _wateringButton.onClick.AddListener(RegisterWatering);
+        }
+
+        if (_lightButton != null)
+        {
+            _lightButton.onClick.RemoveAllListeners();
+            _lightButton.onClick.AddListener(RegisterLightBoost);
         }
 
         UpdateVitalityHudSafeArea();
@@ -937,9 +1487,9 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
 
     private void EnsureVitalitySlider(Transform vitalityHud, bool demoMode)
     {
-        var track = vitalityHud != null ? vitalityHud.Find("Track") : null;
+        var track = vitalityHud != null ? vitalityHud.Find("VitalityTrack") : null;
         var fillRect = vitalityHud != null
-            ? vitalityHud.Find("Track/Fill") as RectTransform
+            ? vitalityHud.Find("VitalityTrack/Fill") as RectTransform
             : null;
         if (track == null || fillRect == null)
         {
@@ -995,19 +1545,33 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
 
     private void UpdateVitalityHudSafeArea()
     {
-        if (_vitalityHudRect == null || Screen.width <= 0 || Screen.height <= 0)
+        if ((_vitalityHudRect == null && _careHudRect == null)
+            || Screen.width <= 0
+            || Screen.height <= 0)
         {
             return;
         }
 
-        var canvas = _vitalityHudRect.GetComponentInParent<Canvas>();
+        var referenceRect = _vitalityHudRect != null ? _vitalityHudRect : _careHudRect;
+        var canvas = referenceRect.GetComponentInParent<Canvas>();
         var scaleFactor = canvas != null ? Mathf.Max(0.01f, canvas.scaleFactor) : 1f;
         var safeArea = Screen.safeArea;
+        var leftInset = safeArea.xMin / scaleFactor;
         var rightInset = (Screen.width - safeArea.xMax) / scaleFactor;
         var topInset = (Screen.height - safeArea.yMax) / scaleFactor;
-        _vitalityHudRect.anchoredPosition = new Vector2(
-            -32f - rightInset,
-            -32f - topInset);
+        if (_vitalityHudRect != null)
+        {
+            _vitalityHudRect.anchoredPosition = new Vector2(
+                -32f - rightInset,
+                -32f - topInset);
+        }
+
+        if (_careHudRect != null)
+        {
+            _careHudRect.anchoredPosition = new Vector2(
+                32f + leftInset,
+                -32f - topInset);
+        }
     }
 
     private void UpdateVitalityUi(float vitality)
@@ -1033,6 +1597,184 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         {
             _vitalityValueText.text = $"{Mathf.RoundToInt(normalizedVitality * 100f)}%";
         }
+    }
+
+    private void UpdatePlantMetricUi()
+    {
+        if (_plantState == null)
+        {
+            return;
+        }
+
+        UpdateVitalityUi(_plantState.vitality);
+        UpdateMetricUi(
+            _hydrationFillImage,
+            _hydrationValueText,
+            _plantState.hydration,
+            new Color(0.2f, 0.67f, 0.9f, 1f));
+        UpdateMetricUi(
+            _bondFillImage,
+            _bondValueText,
+            _plantState.bond,
+            new Color(0.93f, 0.48f, 0.5f, 1f));
+        UpdateMetricUi(
+            _growthFillImage,
+            _growthValueText,
+            _plantState.displayedGrowthProgress,
+            new Color(0.78f, 0.62f, 0.24f, 1f));
+        UpdateMetricUi(
+            _lightFillImage,
+            _lightValueText,
+            _plantState.lightExposure,
+            GetLightColor(_plantState.lightExposure));
+    }
+
+    private static void UpdateMetricUi(UIImage fillImage, Text valueText, float value, Color color)
+    {
+        var normalizedValue = Mathf.Clamp01(value);
+        if (fillImage != null)
+        {
+            var fillRect = fillImage.rectTransform;
+            fillRect.anchorMax = new Vector2(normalizedValue, 1f);
+            fillImage.color = color;
+        }
+
+        if (valueText != null)
+        {
+            valueText.text = $"{Mathf.RoundToInt(normalizedValue * 100f)}%";
+        }
+    }
+
+    private void UpdateCareUi(bool tracked, bool modelReady)
+    {
+        if (_careHudRect == null
+            || !_careHudRect.gameObject.activeSelf
+            || _plantState == null
+            || _wateringController == null
+            || _plantLightController == null)
+        {
+            return;
+        }
+
+        var demoMode = _experienceProfile != null && _experienceProfile.IsPortfolioDemo;
+        var displayedStageIndex = PlantStageProgressionController.GetStageIndexForProgress(
+            _plantState.displayedGrowthProgress);
+        if (_growthProgressText != null)
+        {
+            if (displayedStageIndex >= PlantState.MaximumStageIndex)
+            {
+                var modePrefix = demoMode ? "\u6f14\u793a\u6210\u957f \u00b7 " : string.Empty;
+                _growthProgressText.text =
+                    $"{modePrefix}\u5df2\u76db\u5f00  \u00b7  \u6210\u957f 100%\n" +
+                    $"\u7167\u6599 {_plantState.careDayCount} \u5929  \u00b7  " +
+                    $"\u4eb2\u5bc6\u5ea6 {Mathf.RoundToInt(_plantState.bond * 100f)}%";
+            }
+            else
+            {
+                var nextStage = displayedStageIndex + 1;
+                var requiredDays = PlantStageProgressionController.GetRequiredCareDays(nextStage);
+                var requiredBond = PlantStageProgressionController.GetRequiredBond(nextStage);
+                _growthProgressText.text =
+                    $"\u6210\u957f {Mathf.RoundToInt(_plantState.displayedGrowthProgress * 100f)}%  \u00b7  " +
+                    $"\u4e0b\u4e00\u5f62\u6001 {GetStageLabel(GetStageName(nextStage))}\n" +
+                    $"\u7167\u6599 {_plantState.careDayCount}/{requiredDays} \u5929  \u00b7  " +
+                    $"\u4eb2\u5bc6 {Mathf.RoundToInt(_plantState.bond * 100f)}/" +
+                    $"{Mathf.RoundToInt(requiredBond * 100f)}%  \u00b7  " +
+                    $"\u5065\u5eb7 {Mathf.RoundToInt(_plantState.vitality * 100f)}%";
+            }
+        }
+
+        var now = System.DateTime.UtcNow;
+        var canWater = _wateringController.CanWater(_plantState, now);
+        if (_wateringButton != null)
+        {
+            _wateringButton.interactable = tracked && modelReady && canWater;
+        }
+
+        if (_wateringButtonText != null)
+        {
+            if (canWater)
+            {
+                var usedWaterings = PlantWateringController.MaximumWateringsPerDay
+                    - _wateringController.GetRemainingWaterings(_plantState, now);
+                _wateringButtonText.text =
+                    $"\u6dcb\u6c34 +20%  {usedWaterings}/" +
+                    PlantWateringController.MaximumWateringsPerDay;
+            }
+            else if (_plantState.hydration >= 0.9999f)
+            {
+                _wateringButtonText.text = "\u6c34\u5206\u5145\u8db3";
+            }
+            else
+            {
+                _wateringButtonText.text = demoMode
+                    ? "\u672c\u8f6e\u5df2\u6dcb\u6c34 5/5"
+                    : "\u4eca\u65e5\u5df2\u6dcb\u6c34 5/5";
+            }
+        }
+
+        var canAddLight = _plantLightController.CanAddLightBoost(_plantState, now);
+        if (_lightButton != null)
+        {
+            _lightButton.interactable = tracked && modelReady && canAddLight;
+        }
+
+        if (_lightButtonText != null)
+        {
+            if (!_plantState.lightEnvironmentSampled)
+            {
+                _lightButtonText.text = tracked
+                    ? "\u6b63\u5728\u68c0\u6d4b\u5149\u7167"
+                    : "\u7b49\u5f85\u5149\u7167\u68c0\u6d4b";
+            }
+            else if (canAddLight)
+            {
+                var usedBoosts = PlantLightController.MaximumBoostsPerDay
+                    - _plantLightController.GetRemainingBoosts(_plantState, now);
+                _lightButtonText.text =
+                    $"\u8865\u5149 +5%  {usedBoosts}/" + PlantLightController.MaximumBoostsPerDay;
+            }
+            else if (_plantState.lightExposure >= 0.9999f)
+            {
+                _lightButtonText.text = "\u5149\u7167\u5145\u8db3";
+            }
+            else
+            {
+                _lightButtonText.text = demoMode
+                    ? "\u672c\u8f6e\u5df2\u8865\u5149 6/6"
+                    : "\u4eca\u65e5\u5df2\u8865\u5149 6/6";
+            }
+        }
+    }
+
+    private static Color GetLightColor(float lightExposure)
+    {
+        var low = new Color(0.72f, 0.42f, 0.16f, 1f);
+        var neutral = new Color(0.94f, 0.72f, 0.2f, 1f);
+        var bright = new Color(1f, 0.91f, 0.48f, 1f);
+        var normalizedLight = Mathf.Clamp01(lightExposure);
+        return normalizedLight <= PlantLightController.NeutralLight
+            ? Color.Lerp(low, neutral, normalizedLight / PlantLightController.NeutralLight)
+            : Color.Lerp(
+                neutral,
+                bright,
+                (normalizedLight - PlantLightController.NeutralLight)
+                    / (1f - PlantLightController.NeutralLight));
+    }
+
+    private static string GetLightEffectLabel(float lightExposure)
+    {
+        if (lightExposure < PlantLightController.NeutralLight - 0.005f)
+        {
+            return "\u751f\u957f\u53d7\u5230\u6291\u5236";
+        }
+
+        if (lightExposure > PlantLightController.NeutralLight + 0.005f)
+        {
+            return "\u751f\u957f\u83b7\u5f97\u4fc3\u8fdb";
+        }
+
+        return "\u4e2d\u6027\u5149\u7167";
     }
 
     private static Color GetVitalityColor(float vitality)
@@ -1146,6 +1888,17 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             return false;
         }
 
+        if (_experienceProfile != null
+            && !ShouldShowDroopTestControls
+            && _plantState != null)
+        {
+            _view.SetGrowthProgressImmediate(_plantState.displayedGrowthProgress);
+            if (_plantState.growthProgress > _plantState.displayedGrowthProgress + 0.0001f)
+            {
+                StartAutomaticGrowthTransition(_plantState.growthProgress);
+            }
+        }
+
         sceneModel.gameObject.SetActive(false);
         LogModelDiagnostics("Cloned complete scene model hierarchy");
         return true;
@@ -1173,6 +1926,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         }
 
         EnsureVitalityUi(existingCanvas.transform, LoadUiFont());
+        EnsureCareUi(existingCanvas.transform, LoadUiFont());
         var oldNestedDroopControls = panel.Find("DroopButtons");
         if (oldNestedDroopControls != null)
         {
@@ -1198,11 +1952,13 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         _droopButtons.Clear();
         _buttonStages.Clear();
         _buttonDroopLevels.Clear();
+        var hasSeedButton = false;
         foreach (var button in existingCanvas.GetComponentsInChildren<Button>(true))
         {
             var stageName = ResolveButtonStageName(button);
             if (!string.IsNullOrEmpty(stageName))
             {
+                hasSeedButton |= stageName == "Seed";
                 _stageButtons.Add(button);
                 _buttonStages[button] = stageName;
                 // Runtime-created UI can survive editor play-mode reload settings.
@@ -1218,6 +1974,23 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
                 _buttonDroopLevels[button] = droopLevel;
                 button.onClick.RemoveAllListeners();
                 button.onClick.AddListener(() => SetDroopLevel(droopLevel));
+            }
+        }
+
+        var stageButtonRow = panel.Find("Buttons");
+        if (!hasSeedButton && stageButtonRow != null)
+        {
+            var seedButton = CreateStageButton(stageButtonRow, LoadUiFont(), "\u79cd\u5b50", "Seed");
+            seedButton.transform.SetSiblingIndex(0);
+            _stageButtons.Insert(0, seedButton);
+        }
+
+        foreach (var button in _stageButtons)
+        {
+            var buttonRect = button != null ? button.GetComponent<RectTransform>() : null;
+            if (buttonRect != null)
+            {
+                buttonRect.sizeDelta = new Vector2(90f, 52f);
             }
         }
 
@@ -1264,10 +2037,33 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             Vector3.one * safeScale * _presenceScale * lifeScale * responseScale;
     }
 
+    private static string GetStageName(int stageIndex)
+    {
+        return GrowthStageNames[Mathf.Clamp(
+            stageIndex,
+            PlantState.MinimumStageIndex,
+            PlantState.MaximumStageIndex)];
+    }
+
+    private static int GetStageIndex(string stageName)
+    {
+        for (var index = 0; index < GrowthStageNames.Length; index++)
+        {
+            if (string.Equals(GrowthStageNames[index], stageName, System.StringComparison.Ordinal))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
     private static string GetStageLabel(string stageName)
     {
         switch (stageName)
         {
+            case "Seed":
+                return "\u79cd\u5b50";
             case "Sprout":
                 return "\u5e7c\u82d7";
             case "Leafing":
@@ -1298,6 +2094,11 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     private string ResolveButtonStageName(Button button)
     {
         var label = button.GetComponentInChildren<Text>(true)?.text ?? button.name;
+        if (label.Contains("\u79cd\u5b50") || label.Contains("Seed"))
+        {
+            return "Seed";
+        }
+
         if (label.Contains("\u5e7c\u82d7") || label.Contains("Sprout"))
         {
             return "Sprout";

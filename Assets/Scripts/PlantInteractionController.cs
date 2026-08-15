@@ -4,7 +4,6 @@ using UnityEngine;
 public sealed class PlantInteractionController
 {
     public const int MaximumMeaningfulInteractionsPerUtcDay = 5;
-    public const float VitalityPerMeaningfulInteraction = 0.12f;
     public const float BondPerMeaningfulInteraction = 0.025f;
     public const float VitalityPerVisit = 0.04f;
     public const float BondPerVisit = 0.01f;
@@ -36,6 +35,7 @@ public sealed class PlantInteractionController
             state.bond = Mathf.Clamp01(state.bond + BondPerVisit);
             state.lastInteractionUtc = PlantState.FormatUtc(now);
             state.lastVisitUtc = PlantState.FormatUtc(now);
+            PlantStageProgressionController.RegisterCareDay(state, now, _profile);
         }
 
         return new PlantInteractionResult(
@@ -59,9 +59,9 @@ public sealed class PlantInteractionController
         if (rewarded)
         {
             state.meaningfulInteractionsToday++;
-            state.vitality = Mathf.Clamp01(state.vitality + VitalityPerMeaningfulInteraction);
             state.bond = Mathf.Clamp01(state.bond + BondPerMeaningfulInteraction);
             state.lastInteractionUtc = PlantState.FormatUtc(now);
+            PlantStageProgressionController.RegisterCareDay(state, now, _profile);
         }
 
         return new PlantInteractionResult(

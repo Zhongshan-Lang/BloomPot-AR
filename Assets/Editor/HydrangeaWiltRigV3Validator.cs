@@ -163,7 +163,7 @@ public static class HydrangeaWiltRigV3Validator
         }
     }
 
-    private static string ValidateOrThrow()
+    public static string ValidateOrThrow()
     {
         ValidateImporter();
 
@@ -237,6 +237,7 @@ public static class HydrangeaWiltRigV3Validator
             $"rendererBones: {bones.Length}\n" +
             $"materials ({materials.Length}): {string.Join(", ", materials.Select(material => material.name))}\n" +
             "matrixTests: 20 discrete combinations + 40 adjacent-transition samples + restore\n" +
+            "leafIdleTests: 63 leaves + root attachment + pose restore\n" +
             "geometryTests: BakeMesh baseline/max-wilt displacement for all five stages";
     }
 
@@ -266,8 +267,11 @@ public static class HydrangeaWiltRigV3Validator
             Require(controller.Initialize(renderer, pivotData), "Runtime controller failed to initialize.");
             Require(Mathf.Abs(controller.PivotCoordinateScale - 0.01f) <= 0.000001f,
                 $"Expected FBX/JSON pivot scale 0.01, found {controller.PivotCoordinateScale:G9}.");
+            Require(controller.AnimatedLeafCount == 63,
+                $"Expected 63 animated leaves, found {controller.AnimatedLeafCount}.");
 
             ValidateBakedGeometry(renderer, controller);
+            ValidateLeafIdleOverlay(renderer, controller);
 
             controller.SetGrowthStage("Bud");
             controller.SetWilt(0f);
@@ -344,6 +348,17 @@ public static class HydrangeaWiltRigV3Validator
         Require(view.SupportsWilt, "HydrangeaView did not expose v3 wilt support.");
         Require(view.CurrentStageName == "Bud", "HydrangeaView did not initialize to Bud.");
 
+        Require(view.SetStageImmediate("Seed"), "HydrangeaView rejected the Basis-backed Seed stage.");
+        Require(view.CurrentStageName == "Seed", "HydrangeaView did not retain the Seed stage.");
+        for (var index = 0; index < renderer.sharedMesh.blendShapeCount; index++)
+        {
+            Require(
+                Mathf.Abs(renderer.GetBlendShapeWeight(index)) < 0.001f,
+                "HydrangeaView did not represent Seed with zero Blend Shape weights.");
+        }
+        Require(controller.CurrentStageName == "Sprout",
+            "The Seed stage did not use Sprout pivot data for the wilt rig.");
+
         foreach (var stage in ExpectedBlendShapes)
         {
             Require(view.SetStageImmediate(stage), $"HydrangeaView rejected stage '{stage}'.");
@@ -356,6 +371,17 @@ public static class HydrangeaWiltRigV3Validator
                     $"HydrangeaView applied an unexpected Blend Shape weight for '{stage}'.");
             }
         }
+
+        var leafingAnchor = PlantStageProgressionController.GetStageAnchor(2);
+        var budAnchor = PlantStageProgressionController.GetStageAnchor(3);
+        Require(view.SetGrowthProgressImmediate(Mathf.Lerp(leafingAnchor, budAnchor, 0.4f)),
+            "HydrangeaView rejected continuous growth between Leafing and Bud.");
+        Require(Mathf.Abs(renderer.GetBlendShapeWeight(
+                    renderer.sharedMesh.GetBlendShapeIndex("Leafing")) - 60f) < 0.01f,
+            "Continuous growth did not preserve the expected Leafing contribution.");
+        Require(Mathf.Abs(renderer.GetBlendShapeWeight(
+                    renderer.sharedMesh.GetBlendShapeIndex("Bud")) - 40f) < 0.01f,
+            "Continuous growth did not apply the expected Bud contribution.");
 
         var propertyBlock = new MaterialPropertyBlock();
         view.SetAppearanceDecayImmediate(0f);
@@ -392,6 +418,50 @@ public static class HydrangeaWiltRigV3Validator
         Require(
             Vector4.Distance(healthyColor, restoredColor) < 0.0001f,
             "HydrangeaView did not restore the healthy material color.");
+    }
+
+    private static void ValidateLeafIdleOverlay(
+        SkinnedMeshRenderer renderer,
+        HydrangeaWiltRigV3Controller controller)
+    {
+        var leaves = renderer.bones
+            .Where(bone => bone.name.StartsWith("WiltLeaf_", StringComparison.Ordinal))
+            .ToArray();
+        Require(leaves.Length == 63, $"Expected 63 leaf bones, found {leaves.Length}.");
+
+        controller.SetGrowthStage("Bloom");
+        controller.SetWilt(0.6f);
+        controller.SetLeafIdleMotionStrength(0f);
+        Require(controller.ApplyPoseNow(), "Failed to establish the leaf idle baseline.");
+        var baselinePositions = leaves.Select(leaf => leaf.localPosition).ToArray();
+        var baselineRotations = leaves.Select(leaf => leaf.localRotation).ToArray();
+        var baselineScales = leaves.Select(leaf => leaf.localScale).ToArray();
+
+        controller.SetLeafIdleMotionStrength(1f);
+        Require(controller.ApplyPoseNow(), "Failed to apply leaf idle motion.");
+        var movedLeaves = 0;
+        for (var index = 0; index < leaves.Length; index++)
+        {
+            Require(Vector3.Distance(leaves[index].localPosition, baselinePositions[index]) < 0.000001f,
+                $"Leaf '{leaves[index].name}' idle motion changed its root position.");
+            Require(Vector3.Distance(leaves[index].localScale, baselineScales[index]) < 0.000001f,
+                $"Leaf '{leaves[index].name}' idle motion changed its scale.");
+            if (Quaternion.Angle(leaves[index].localRotation, baselineRotations[index]) > 0.05f)
+            {
+                movedLeaves++;
+            }
+        }
+
+        Require(movedLeaves >= 50,
+            $"Leaf idle motion affected only {movedLeaves} of 63 leaves.");
+
+        controller.SetLeafIdleMotionStrength(0f);
+        Require(controller.ApplyPoseNow(), "Failed to restore the leaf idle baseline.");
+        for (var index = 0; index < leaves.Length; index++)
+        {
+            Require(Quaternion.Angle(leaves[index].localRotation, baselineRotations[index]) < 0.001f,
+                $"Leaf '{leaves[index].name}' did not restore its base rotation.");
+        }
     }
 
     private static void ValidateBakedGeometry(

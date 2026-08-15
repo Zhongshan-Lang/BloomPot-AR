@@ -1,6 +1,5 @@
 using System.Collections;
 using System.Collections.Generic;
-using System.Linq;
 using UnityEngine;
 
 [DisallowMultipleComponent]
@@ -8,6 +7,8 @@ public sealed class HydrangeaView : MonoBehaviour
 {
     private const string PetalMaterialResourcePath = "HydrangeaInteractive/Materials/M_Hydrangea_Petals_Random";
     private const string CenterMaterialResourcePath = "HydrangeaInteractive/Materials/M_Hydrangea_Centers";
+    private static readonly string[] GrowthStageNames =
+        { "Seed", "Sprout", "Leafing", "Bud", "HalfBloom", "Bloom" };
     private static readonly string[] ManagedBlendShapes = { "Sprout", "Leafing", "Bud", "HalfBloom", "Bloom" };
     private static readonly int BaseColorProperty = Shader.PropertyToID("_BaseColor");
     private static readonly int BloomMaturityProperty = Shader.PropertyToID("_BloomMaturity");
@@ -32,11 +33,13 @@ public sealed class HydrangeaView : MonoBehaviour
     private Color _wiltTint = new Color(0.95f, 0.78f, 0.32f, 1f);
     private float _wiltTintStrength = 0.35f;
     private float _currentBloomMaturity;
+    private float _currentGrowthProgress;
     private float _requestedWilt;
     private float _appearanceDecay;
     private float _lastAppliedBloomMaturity = -1f;
     private float _lastAppliedAppearanceDecay = -1f;
     private int _fallbackBlendShapeIndex = -1;
+    private int[] _rendererBlendShapeIndices = new int[0];
     private string _currentStageName;
     private float _responseScale = 1f;
     private float _responseRoll;
@@ -46,6 +49,7 @@ public sealed class HydrangeaView : MonoBehaviour
     public bool IsReady => _renderer != null && CanPresentAnyStage();
     public bool SupportsWilt => _droopController != null || _wiltRigV3Controller != null;
     public string CurrentStageName => _currentStageName;
+    public float CurrentGrowthProgress => _currentGrowthProgress;
     public float ResponseScale => _responseScale;
     public float ResponseRoll => _responseRoll;
     public float LifeScale => _lifeScale;
@@ -104,9 +108,11 @@ public sealed class HydrangeaView : MonoBehaviour
         _droopController = null;
         _wiltRigV3Controller = null;
         _blendShapeIndices.Clear();
+        _rendererBlendShapeIndices = new int[0];
         _fallbackBlendShapeIndex = -1;
         _currentStageName = null;
         _currentBloomMaturity = 0f;
+        _currentGrowthProgress = 0f;
         _requestedWilt = 0f;
         _appearanceDecay = 0f;
         _responseScale = 1f;
@@ -125,6 +131,7 @@ public sealed class HydrangeaView : MonoBehaviour
             Time.unscaledDeltaTime);
         _lifeScale = lifeFrame.Scale;
         _lifeRotationEuler = lifeFrame.RotationEuler;
+        _wiltRigV3Controller?.SetLeafIdleMotionStrength(lifeFrame.MotionStrength);
         _appearanceDecay = Mathf.Clamp01(appearanceDecay);
         ApplyMaterialAppearance(_appearanceDecay);
     }
@@ -174,19 +181,47 @@ public sealed class HydrangeaView : MonoBehaviour
             return;
         }
 
-        if (_transitionRoutine != null)
-        {
-            StopCoroutine(_transitionRoutine);
-        }
-
-        var fromStageName = string.IsNullOrEmpty(_currentStageName) ? blendShapeName : _currentStageName;
-        _currentStageName = blendShapeName;
-        _transitionRoutine = StartCoroutine(AnimateStageChange(fromStageName, blendShapeName));
+        SetGrowthProgressTarget(
+            PlantStageProgressionController.GetStageAnchor(GetStageIndex(blendShapeName)),
+            0.35f);
     }
 
     public bool SetStageImmediate(string blendShapeName)
     {
         if (_renderer == null || !CanPresentStage(blendShapeName))
+        {
+            return false;
+        }
+
+        return SetGrowthProgressImmediate(
+            PlantStageProgressionController.GetStageAnchor(GetStageIndex(blendShapeName)));
+    }
+
+    public void SetGrowthProgressTarget(float growthProgress, float duration)
+    {
+        if (_renderer == null || !CanPresentAnyStage())
+        {
+            return;
+        }
+
+        if (_transitionRoutine != null)
+        {
+            StopCoroutine(_transitionRoutine);
+        }
+
+        var targetProgress = Mathf.Clamp01(growthProgress);
+        if (duration <= 0f || Mathf.Abs(targetProgress - _currentGrowthProgress) < 0.0001f)
+        {
+            SetGrowthProgressImmediate(targetProgress);
+            return;
+        }
+
+        _transitionRoutine = StartCoroutine(AnimateGrowthProgress(targetProgress, duration));
+    }
+
+    public bool SetGrowthProgressImmediate(float growthProgress)
+    {
+        if (_renderer == null || !CanPresentAnyStage())
         {
             return false;
         }
@@ -197,8 +232,7 @@ public sealed class HydrangeaView : MonoBehaviour
             _transitionRoutine = null;
         }
 
-        _currentStageName = blendShapeName;
-        ApplyStageImmediately(blendShapeName);
+        ApplyGrowthProgress(Mathf.Clamp01(growthProgress));
         return true;
     }
 
@@ -207,6 +241,11 @@ public sealed class HydrangeaView : MonoBehaviour
         if (_renderer == null || _renderer.sharedMesh == null)
         {
             return false;
+        }
+
+        if (stageName == "Seed")
+        {
+            return _blendShapeIndices.ContainsKey("Sprout");
         }
 
         if (_blendShapeIndices.ContainsKey(stageName))
@@ -219,47 +258,19 @@ public sealed class HydrangeaView : MonoBehaviour
             && _blendShapeIndices.ContainsKey("Bloom");
     }
 
-    private IEnumerator AnimateStageChange(string fromStageName, string blendShapeName)
+    private IEnumerator AnimateGrowthProgress(float targetProgress, float duration)
     {
-        var targetWeights = BuildTargetWeights(blendShapeName);
-        if (targetWeights == null)
-        {
-            yield break;
-        }
-
-        var rendererIndices = CollectRendererBlendShapeIndices();
-        var fromWeights = new Dictionary<int, float>();
-        foreach (var index in rendererIndices)
-        {
-            fromWeights[index] = _renderer.GetBlendShapeWeight(index);
-        }
-
-        const float duration = 0.35f;
-        var fromBloomMaturity = _currentBloomMaturity;
-        var targetBloomMaturity = GetBloomMaturity(blendShapeName);
-        var fromDroopStageScale = _droopController != null
-            ? new Vector2(_droopController.LeafStageScale, _droopController.HeadStageScale)
-            : Vector2.one;
-        var targetDroopStageScale = GetDroopStageScale(blendShapeName);
+        var fromProgress = _currentGrowthProgress;
         var elapsed = 0f;
         while (elapsed < duration)
         {
-            elapsed += Time.deltaTime;
+            elapsed += Time.unscaledDeltaTime;
             var t = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(elapsed / duration));
-            foreach (var index in rendererIndices)
-            {
-                targetWeights.TryGetValue(index, out var targetWeight);
-                var weight = Mathf.Lerp(fromWeights[index], targetWeight, t);
-                _renderer.SetBlendShapeWeight(index, weight);
-            }
-
-            SetBloomMaturity(Mathf.Lerp(fromBloomMaturity, targetBloomMaturity, t));
-            SetDroopStageScale(Vector2.Lerp(fromDroopStageScale, targetDroopStageScale, t));
-            _wiltRigV3Controller?.SetGrowthTransition(fromStageName, blendShapeName, t);
+            ApplyGrowthProgress(Mathf.Lerp(fromProgress, targetProgress, t));
             yield return null;
         }
 
-        ApplyStageImmediately(blendShapeName);
+        ApplyGrowthProgress(targetProgress);
         _transitionRoutine = null;
     }
 
@@ -284,26 +295,53 @@ public sealed class HydrangeaView : MonoBehaviour
 
     private void ApplyStageImmediately(string blendShapeName)
     {
+        ApplyGrowthProgress(
+            PlantStageProgressionController.GetStageAnchor(GetStageIndex(blendShapeName)));
+    }
+
+    private void ApplyGrowthProgress(float growthProgress)
+    {
         if (_renderer == null)
         {
             return;
         }
 
-        var targetWeights = BuildTargetWeights(blendShapeName);
-        if (targetWeights == null)
+        var progress = Mathf.Clamp01(growthProgress);
+        var lowerStageIndex = PlantStageProgressionController.GetStageIndexForProgress(progress);
+        var upperStageIndex = Mathf.Min(lowerStageIndex + 1, PlantState.MaximumStageIndex);
+        var lowerAnchor = PlantStageProgressionController.GetStageAnchor(lowerStageIndex);
+        var upperAnchor = PlantStageProgressionController.GetStageAnchor(upperStageIndex);
+        var segmentProgress = upperStageIndex == lowerStageIndex
+            ? 0f
+            : Mathf.InverseLerp(lowerAnchor, upperAnchor, progress);
+        var lowerStageName = GrowthStageNames[lowerStageIndex];
+        var upperStageName = GrowthStageNames[upperStageIndex];
+        if (!CanPresentStage(lowerStageName) || !CanPresentStage(upperStageName))
         {
             return;
         }
 
-        foreach (var index in CollectRendererBlendShapeIndices())
+        foreach (var index in _rendererBlendShapeIndices)
         {
-            targetWeights.TryGetValue(index, out var targetWeight);
-            _renderer.SetBlendShapeWeight(index, targetWeight);
+            var lowerWeight = GetTargetWeight(lowerStageName, index);
+            var upperWeight = GetTargetWeight(upperStageName, index);
+            _renderer.SetBlendShapeWeight(index, Mathf.Lerp(lowerWeight, upperWeight, segmentProgress));
         }
 
-        SetBloomMaturity(GetBloomMaturity(blendShapeName));
-        SetDroopStageScale(GetDroopStageScale(blendShapeName));
-        _wiltRigV3Controller?.SetGrowthStage(blendShapeName);
+        SetBloomMaturity(Mathf.Lerp(
+            GetBloomMaturity(lowerStageName),
+            GetBloomMaturity(upperStageName),
+            segmentProgress));
+        SetDroopStageScale(Vector2.Lerp(
+            GetDroopStageScale(lowerStageName),
+            GetDroopStageScale(upperStageName),
+            segmentProgress));
+        _wiltRigV3Controller?.SetGrowthTransition(
+            GetWiltRigStageName(lowerStageName),
+            GetWiltRigStageName(upperStageName),
+            segmentProgress);
+        _currentGrowthProgress = progress;
+        _currentStageName = lowerStageName;
     }
 
     private void SetDroopStageScale(Vector2 stageScale)
@@ -315,6 +353,7 @@ public sealed class HydrangeaView : MonoBehaviour
     {
         switch (stageName)
         {
+            case "Seed":
             case "Sprout":
                 return Vector2.zero;
             case "Leafing":
@@ -578,6 +617,18 @@ public sealed class HydrangeaView : MonoBehaviour
                 _blendShapeIndices[blendShapeName] = index;
             }
         }
+
+        var uniqueIndices = new List<int>(_blendShapeIndices.Count);
+        foreach (var index in _blendShapeIndices.Values)
+        {
+            if (!uniqueIndices.Contains(index))
+            {
+                uniqueIndices.Add(index);
+            }
+        }
+
+        uniqueIndices.Sort();
+        _rendererBlendShapeIndices = uniqueIndices.ToArray();
     }
 
     private void ApplyInitialVisibleStage()
@@ -651,38 +702,36 @@ public sealed class HydrangeaView : MonoBehaviour
         return false;
     }
 
-    private Dictionary<int, float> BuildTargetWeights(string stageName)
+    private float GetTargetWeight(string stageName, int blendShapeIndex)
     {
-        if (_renderer == null || _renderer.sharedMesh == null)
+        if (stageName == "Seed")
         {
-            return null;
+            return 0f;
         }
 
-        var result = new Dictionary<int, float>();
         if (_blendShapeIndices.TryGetValue(stageName, out var directIndex))
         {
-            result[directIndex] = 100f;
-            return result;
+            return blendShapeIndex == directIndex ? 100f : 0f;
         }
 
         if (stageName == "HalfBloom"
             && _blendShapeIndices.TryGetValue("Bud", out var budIndex)
             && _blendShapeIndices.TryGetValue("Bloom", out var bloomIndex))
         {
-            result[budIndex] = 40f;
-            result[bloomIndex] = 60f;
-            return result;
+            if (blendShapeIndex == budIndex)
+            {
+                return 40f;
+            }
+
+            return blendShapeIndex == bloomIndex ? 60f : 0f;
         }
 
-        return null;
+        return 0f;
     }
 
-    private List<int> CollectRendererBlendShapeIndices()
+    private static string GetWiltRigStageName(string stageName)
     {
-        return _blendShapeIndices.Values
-            .Distinct()
-            .OrderBy(index => index)
-            .ToList();
+        return stageName == "Seed" ? "Sprout" : stageName;
     }
 
     private static float GetBloomMaturity(string stageName)
@@ -698,5 +747,18 @@ public sealed class HydrangeaView : MonoBehaviour
             default:
                 return 0f;
         }
+    }
+
+    private static int GetStageIndex(string stageName)
+    {
+        for (var i = 0; i < GrowthStageNames.Length; i++)
+        {
+            if (GrowthStageNames[i] == stageName)
+            {
+                return i;
+            }
+        }
+
+        return PlantState.MinimumStageIndex;
     }
 }

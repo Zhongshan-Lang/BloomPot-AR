@@ -8,6 +8,12 @@ public sealed class HydrangeaWiltRigV3Controller : MonoBehaviour
 {
     private const string ExpectedSchema = "BloomPot.HydrangeaWiltRig.v3";
     private const int ExpectedBoneCount = 110;
+    private const int ExpectedLeafBoneCount = 63;
+    private const float LeafIdleCycleDuration = 4.8f;
+    private const float LeafIdleResetThreshold = 0.0001f;
+    public const float MaximumLeafPitchAmplitude = 0.65f;
+    public const float MaximumLeafYawAmplitude = 0.3f;
+    public const float MaximumLeafRollAmplitude = 1.6f;
     private static readonly string[] ExpectedBlendShapes =
     {
         "Sprout",
@@ -25,12 +31,17 @@ public sealed class HydrangeaWiltRigV3Controller : MonoBehaviour
     private readonly Dictionary<string, int> _bindingIndices = new Dictionary<string, int>();
     private Matrix4x4[] _deformationMatrices = Array.Empty<Matrix4x4>();
     private Matrix4x4[] _targetWorldMatrices = Array.Empty<Matrix4x4>();
+    private Quaternion[] _baseLocalRotations = Array.Empty<Quaternion>();
     private HydrangeaWiltRigV3Document _document;
     private float _pivotCoordinateScale = 1f;
     private Matrix4x4 _jsonToRendererCoordinates = Matrix4x4.identity;
     private float _coordinateHandedness = 1f;
     private float _currentWilt;
     private float _targetWilt;
+    private float _leafIdleMotionStrength;
+    private float _leafIdleElapsed;
+    private bool _leafIdlePoseApplied;
+    private int _leafBindingCount;
     private string _stageName = "Bud";
     private string _transitionFromStage;
     private string _transitionToStage;
@@ -45,6 +56,7 @@ public sealed class HydrangeaWiltRigV3Controller : MonoBehaviour
     public float CurrentWilt => _currentWilt;
     public string CurrentStageName => _stageName;
     public float PivotCoordinateScale => _pivotCoordinateScale;
+    public int AnimatedLeafCount => _leafBindingCount;
 
     private void Awake()
     {
@@ -68,9 +80,18 @@ public sealed class HydrangeaWiltRigV3Controller : MonoBehaviour
             _poseDirty = true;
         }
 
+        if (_leafIdleMotionStrength > LeafIdleResetThreshold)
+        {
+            _leafIdleElapsed += Mathf.Clamp(Time.unscaledDeltaTime, 0f, 0.1f);
+        }
+
         if (_poseDirty)
         {
             ApplyPoseNow();
+        }
+        else
+        {
+            ApplyLeafIdlePose(false);
         }
     }
 
@@ -154,6 +175,11 @@ public sealed class HydrangeaWiltRigV3Controller : MonoBehaviour
         SetWiltTarget(0f);
     }
 
+    public void SetLeafIdleMotionStrength(float strength)
+    {
+        _leafIdleMotionStrength = Mathf.Clamp01(strength);
+    }
+
     public bool ApplyPoseNow()
     {
         if (!_initialized)
@@ -164,6 +190,7 @@ public sealed class HydrangeaWiltRigV3Controller : MonoBehaviour
         try
         {
             ApplyPoseOrThrow();
+            ApplyLeafIdlePose(true);
             _poseDirty = false;
             return true;
         }
@@ -237,6 +264,7 @@ public sealed class HydrangeaWiltRigV3Controller : MonoBehaviour
 
         _bindings.Clear();
         _bindingIndices.Clear();
+        _leafBindingCount = 0;
         foreach (var boneData in _document.bones)
         {
             Require(boneData != null && !string.IsNullOrEmpty(boneData.name), "JSON contains an unnamed bone.");
@@ -254,17 +282,25 @@ public sealed class HydrangeaWiltRigV3Controller : MonoBehaviour
             }
 
             ValidateBoneData(boneData);
+            var leafMotionIndex = string.Equals(boneData.kind, "leaf", StringComparison.Ordinal)
+                ? _leafBindingCount++
+                : -1;
             _bindingIndices.Add(boneData.name, _bindings.Count);
             _bindings.Add(new BoneBinding(
                 boneData,
                 rendererBones[rendererIndex],
                 rendererIndex,
                 parentIndex,
-                bindposes[rendererIndex]));
+                bindposes[rendererIndex],
+                leafMotionIndex));
         }
+
+        Require(_leafBindingCount == ExpectedLeafBoneCount,
+            $"Expected {ExpectedLeafBoneCount} leaf bones, found {_leafBindingCount}.");
 
         _deformationMatrices = new Matrix4x4[_bindings.Count];
         _targetWorldMatrices = new Matrix4x4[_bindings.Count];
+        _baseLocalRotations = new Quaternion[_bindings.Count];
         _pivotCoordinateScale = CalculateCoordinateTransform(
             out _jsonToRendererCoordinates,
             out _coordinateHandedness);
@@ -308,7 +344,70 @@ public sealed class HydrangeaWiltRigV3Controller : MonoBehaviour
             binding.Transform.localPosition = position;
             binding.Transform.localRotation = rotation;
             binding.Transform.localScale = scale;
+            _baseLocalRotations[index] = rotation;
         }
+    }
+
+    private void ApplyLeafIdlePose(bool basePoseWasJustApplied)
+    {
+        if (_leafIdleMotionStrength <= LeafIdleResetThreshold)
+        {
+            if (_leafIdlePoseApplied && !basePoseWasJustApplied)
+            {
+                for (var index = 0; index < _bindings.Count; index++)
+                {
+                    var binding = _bindings[index];
+                    if (binding.LeafMotionIndex >= 0)
+                    {
+                        binding.Transform.localRotation = _baseLocalRotations[index];
+                    }
+                }
+            }
+
+            _leafIdlePoseApplied = false;
+            return;
+        }
+
+        for (var index = 0; index < _bindings.Count; index++)
+        {
+            var binding = _bindings[index];
+            if (binding.LeafMotionIndex < 0)
+            {
+                continue;
+            }
+
+            var idleEuler = EvaluateLeafIdleEuler(
+                binding.LeafMotionIndex,
+                _leafIdleElapsed,
+                _leafIdleMotionStrength);
+            binding.Transform.localRotation =
+                _baseLocalRotations[index] * Quaternion.Euler(idleEuler);
+        }
+
+        _leafIdlePoseApplied = true;
+    }
+
+    public static Vector3 EvaluateLeafIdleEuler(
+        int leafIndex,
+        float elapsed,
+        float strength)
+    {
+        if (leafIndex < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(leafIndex));
+        }
+
+        var clampedStrength = Mathf.Clamp01(strength);
+        var phaseOffset = Mathf.Repeat(leafIndex * 2.3999632f, Mathf.PI * 2f);
+        var speedStep = ((leafIndex * 37) % 19) / 18f;
+        var speed = Mathf.Lerp(0.82f, 1.18f, speedStep);
+        var direction = (leafIndex & 1) == 0 ? 1f : -1f;
+        var phase = elapsed * Mathf.PI * 2f / LeafIdleCycleDuration * speed + phaseOffset;
+
+        return new Vector3(
+            Mathf.Sin(phase * 0.73f + 0.6f) * MaximumLeafPitchAmplitude * clampedStrength,
+            Mathf.Sin(phase * 0.41f - 0.2f) * MaximumLeafYawAmplitude * clampedStrength,
+            Mathf.Sin(phase) * MaximumLeafRollAmplitude * clampedStrength * direction);
     }
 
     private Matrix4x4 BuildLocalDeformation(HydrangeaWiltRigV3Bone bone)
@@ -584,13 +683,15 @@ public sealed class HydrangeaWiltRigV3Controller : MonoBehaviour
             Transform transform,
             int rendererIndex,
             int parentIndex,
-            Matrix4x4 bindpose)
+            Matrix4x4 bindpose,
+            int leafMotionIndex)
         {
             Data = data;
             Transform = transform;
             RendererIndex = rendererIndex;
             ParentIndex = parentIndex;
             Bindpose = bindpose;
+            LeafMotionIndex = leafMotionIndex;
         }
 
         public HydrangeaWiltRigV3Bone Data { get; }
@@ -598,6 +699,7 @@ public sealed class HydrangeaWiltRigV3Controller : MonoBehaviour
         public int RendererIndex { get; }
         public int ParentIndex { get; }
         public Matrix4x4 Bindpose { get; }
+        public int LeafMotionIndex { get; }
     }
 }
 

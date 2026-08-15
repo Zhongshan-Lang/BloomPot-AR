@@ -20,6 +20,7 @@ public sealed class PlantExperienceProfile
         TimeSpan maximumDecayEvaluation,
         TimeSpan visitRewardInterval,
         TimeSpan interactionLimitWindow,
+        TimeSpan simulatedDayDuration,
         bool usesUtcDailyInteractionReset,
         bool usesRealtimeDecay,
         float minimumVitality)
@@ -32,6 +33,7 @@ public sealed class PlantExperienceProfile
         MaximumDecayEvaluation = maximumDecayEvaluation;
         VisitRewardInterval = visitRewardInterval;
         InteractionLimitWindow = interactionLimitWindow;
+        SimulatedDayDuration = simulatedDayDuration;
         UsesUtcDailyInteractionReset = usesUtcDailyInteractionReset;
         UsesRealtimeDecay = usesRealtimeDecay;
         MinimumVitality = minimumVitality;
@@ -45,6 +47,7 @@ public sealed class PlantExperienceProfile
     public TimeSpan MaximumDecayEvaluation { get; }
     public TimeSpan VisitRewardInterval { get; }
     public TimeSpan InteractionLimitWindow { get; }
+    public TimeSpan SimulatedDayDuration { get; }
     public bool UsesUtcDailyInteractionReset { get; }
     public bool UsesRealtimeDecay { get; }
     public float MinimumVitality { get; }
@@ -59,6 +62,7 @@ public sealed class PlantExperienceProfile
         TimeSpan.FromDays(30d),
         TimeSpan.FromHours(4d),
         TimeSpan.FromDays(1d),
+        TimeSpan.FromDays(1d),
         true,
         false,
         0f);
@@ -71,7 +75,8 @@ public sealed class PlantExperienceProfile
         0.01f,
         TimeSpan.FromSeconds(120d),
         TimeSpan.FromSeconds(20d),
-        TimeSpan.FromSeconds(60d),
+        TimeSpan.FromSeconds(40d),
+        TimeSpan.FromSeconds(20d),
         false,
         true,
         0f);
