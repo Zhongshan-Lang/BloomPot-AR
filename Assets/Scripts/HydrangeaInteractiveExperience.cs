@@ -76,6 +76,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
     private Text _growthValueText;
     private UIImage _lightFillImage;
     private Text _lightValueText;
+    private RectTransform _controlPanelRect;
     private RectTransform _vitalityHudRect;
     private RectTransform _careHudRect;
     private Text _experienceModeText;
@@ -145,7 +146,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         UpdateLightExposure(tracked);
         UpdateRealtimeGrowth();
         UpdateCompanionInteraction(tracked);
-        UpdateVitalityHudSafeArea();
+        UpdateUiSafeArea();
         var modelReady = _view != null && _view.IsReady;
         var vitality = _plantState != null ? _plantState.vitality : 1f;
         var appearanceDecay = ShouldShowDroopTestControls
@@ -456,11 +457,30 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             return;
         }
 
+        SettleStateForSave(System.DateTime.UtcNow);
         SyncDisplayedGrowthProgress();
 
         if (!_plantSaveService.TrySave(_plantState, out var error))
         {
             Debug.LogError($"HydrangeaInteractiveExperience: plant state save failed: {error}", this);
+        }
+    }
+
+    private void SettleStateForSave(System.DateTime utcNow)
+    {
+        if (_plantGrowthController == null
+            || _plantHydrationController == null
+            || ShouldShowDroopTestControls)
+        {
+            return;
+        }
+
+        var growthResult = _plantGrowthController.ApplyRealtimeProgress(_plantState, utcNow);
+        _plantHydrationController.ApplyTimeProgress(_plantState, utcNow);
+        if (growthResult.VitalityChanged)
+        {
+            EvaluateGrowthProgress(utcNow);
+            ApplyCompanionStateToView();
         }
     }
 
@@ -599,6 +619,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
 
         var panel = CreateUiObject("Panel", canvasObject.transform);
         var panelRect = panel.GetComponent<RectTransform>();
+        _controlPanelRect = panelRect;
         panelRect.anchorMin = new Vector2(0.5f, 0f);
         panelRect.anchorMax = new Vector2(0.5f, 0f);
         panelRect.pivot = new Vector2(0.5f, 0f);
@@ -1305,7 +1326,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             _demoResetButton.onClick.AddListener(ResetDemoState);
         }
 
-        UpdateVitalityHudSafeArea();
+        UpdateUiSafeArea();
     }
 
     private static void CreateMetricRow(
@@ -1482,7 +1503,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
             _lightButton.onClick.AddListener(RegisterLightBoost);
         }
 
-        UpdateVitalityHudSafeArea();
+        UpdateUiSafeArea();
     }
 
     private void EnsureVitalitySlider(Transform vitalityHud, bool demoMode)
@@ -1543,22 +1564,34 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
         }
     }
 
-    private void UpdateVitalityHudSafeArea()
+    private void UpdateUiSafeArea()
     {
-        if ((_vitalityHudRect == null && _careHudRect == null)
+        if ((_controlPanelRect == null && _vitalityHudRect == null && _careHudRect == null)
             || Screen.width <= 0
             || Screen.height <= 0)
         {
             return;
         }
 
-        var referenceRect = _vitalityHudRect != null ? _vitalityHudRect : _careHudRect;
+        var referenceRect = _vitalityHudRect != null
+            ? _vitalityHudRect
+            : _careHudRect != null
+                ? _careHudRect
+                : _controlPanelRect;
         var canvas = referenceRect.GetComponentInParent<Canvas>();
         var scaleFactor = canvas != null ? Mathf.Max(0.01f, canvas.scaleFactor) : 1f;
         var safeArea = Screen.safeArea;
         var leftInset = safeArea.xMin / scaleFactor;
         var rightInset = (Screen.width - safeArea.xMax) / scaleFactor;
         var topInset = (Screen.height - safeArea.yMax) / scaleFactor;
+        var bottomInset = safeArea.yMin / scaleFactor;
+        if (_controlPanelRect != null)
+        {
+            _controlPanelRect.anchoredPosition = new Vector2(
+                _controlPanelRect.anchoredPosition.x,
+                48f + bottomInset);
+        }
+
         if (_vitalityHudRect != null)
         {
             _vitalityHudRect.anchoredPosition = new Vector2(
@@ -1920,6 +1953,7 @@ public sealed class HydrangeaInteractiveExperience : MonoBehaviour
 
         _statusText = panel.Find("Status")?.GetComponent<Text>();
         var panelRect = panel.GetComponent<RectTransform>();
+        _controlPanelRect = panelRect;
         if (panelRect != null)
         {
             panelRect.sizeDelta = new Vector2(620f, 156f);
